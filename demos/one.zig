@@ -2,6 +2,8 @@ const std = @import("std");
 const vx = @import("vortex").Vortex;
 const assert = std.debug.assert;
 
+const ztracy = @import("ztracy");
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer if (@import("builtin").mode == .Debug) {
@@ -10,6 +12,8 @@ pub fn main() !void {
 
     const InitTask = struct {
         fn subtask(val: usize) !usize {
+            ztracy.Message("Init subtask");
+
             vx.event.emit(SubtaskStartEvent, .{ .val = val });
 
             const interval = @intCast(vx.Timespec, val);
@@ -21,6 +25,8 @@ pub fn main() !void {
 
         fn start() !void {
             vx.event.emit(InitStartEvent, .{});
+
+            std.time.sleep(10 * std.time.ns_per_s);
 
             const Handle = vx.task.SpawnHandle(subtask);
             var tasks = [1]Handle{undefined} ** 4;

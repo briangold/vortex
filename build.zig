@@ -1,4 +1,6 @@
 const std = @import("std");
+const ztracy = @import("libs/ztracy/build.zig");
+
 const Builder = std.build.Builder;
 const Step = std.build.Step;
 
@@ -19,6 +21,16 @@ fn addDemo(
     exe.setTarget(options.target);
     exe.setBuildMode(options.mode);
     exe.addPackage(pkgs.vortex);
+
+    const exe_options = b.addOptions();
+    exe_options.addOption(bool, "enable_tracy", options.enable_tracy);
+    exe.addOptions("build_options", exe_options);
+
+    const options_pkg = exe_options.getPackage("build_options");
+    exe.addPackage(ztracy.getPkg(b, options_pkg));
+
+    ztracy.link(exe, options.enable_tracy);
+
     exe.install();
 
     const run_cmd = exe.run();
@@ -81,6 +93,7 @@ fn addFuzzer(b: *Builder, comptime fuzzer: anytype) !void {
 pub fn build(b: *Builder) !void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
+    const enable_tracy = b.option(bool, "enable-tracy", "Enable Tracy profiler") orelse false;
 
     const demos = [_]struct {
         name: []const u8,
@@ -92,7 +105,11 @@ pub fn build(b: *Builder) !void {
     };
 
     inline for (demos) |demo| {
-        try addDemo(b, demo, .{ .target = target, .mode = mode });
+        try addDemo(b, demo, .{
+            .target = target,
+            .mode = mode,
+            .enable_tracy = enable_tracy,
+        });
     }
 
     const list_demo_step = b.step("list-demos", "List demos to run");
