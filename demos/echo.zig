@@ -2,6 +2,8 @@ const std = @import("std");
 const vx = @import("vortex").Vortex;
 const assert = std.debug.assert;
 
+const ztracy = @import("ztracy");
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer if (@import("builtin").mode == .Debug) {
@@ -15,6 +17,9 @@ pub fn main() !void {
 
             var buf: [4096]u8 = undefined;
             while (true) {
+                const tracy_zone = ztracy.ZoneNC(@src(), "Message handler", 0x00_ff_00_00);
+                defer tracy_zone.End();
+
                 // await a message from the client
                 const rc = try stream.recv(&buf, null);
                 if (rc == 0) break; // client disconnected

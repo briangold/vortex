@@ -7,6 +7,8 @@ const scheduler = @import("scheduler.zig");
 const Emitter = @import("event.zig").Emitter;
 const EventRegistry = @import("event.zig").EventRegistry;
 
+const ztracy = @import("ztracy");
+
 threadlocal var thread_id: usize = 0;
 
 pub fn threadId() usize {
@@ -169,13 +171,23 @@ pub fn RuntimeImpl(comptime Loop: type) type {
                 // The core loop
                 while (!done.load(.Monotonic)) {
                     // Check for I/O activity and timeouts
-                    // TODO: poll timeout as constant
-                    _ = self.loop.poll(std.time.ns_per_ms) catch |err| {
-                        std.debug.panic("Runtime error: {}\n", .{err});
-                    };
+                    {
+                        const tracy_zone = ztracy.ZoneNC(@src(), "I/O poll", 0x00_ff_00_00);
+                        defer tracy_zone.End();
+
+                        // TODO: poll timeout as constant
+                        _ = self.loop.poll(std.time.ns_per_ms) catch |err| {
+                            std.debug.panic("Runtime error: {}\n", .{err});
+                        };
+                    }
 
                     // Drive task execution in the scheduler
-                    _ = rt.sched.tick();
+                    {
+                        const tracy_zone = ztracy.ZoneNC(@src(), "Task exec", 0x00_00_00_ff);
+                        defer tracy_zone.End();
+
+                        _ = rt.sched.tick();
+                    }
                 }
 
                 // Invariant checks

@@ -10,6 +10,8 @@ const Emitter = @import("event.zig").Emitter;
 const EventRegistry = @import("event.zig").EventRegistry;
 const threadId = @import("runtime.zig").threadId;
 
+const ztracy = @import("ztracy");
+
 // The scheduler needs to serve the following workflows:
 //   1 - tasks suspending for I/O operations
 //   2 - tasks spawning new sub-tasks
@@ -89,6 +91,7 @@ const Task = struct {
     id: Index,
     parent: ?Index,
     state: State,
+    name: [64]u8 = undefined,
     deadline: Timespec,
     frame: ?anyframe,
     io_token: ?CancelToken,
@@ -199,6 +202,7 @@ fn SchedulerImpl(comptime C: type) type {
                 var task = &self.tasks[tid];
 
                 self.emitEvent(TaskResumeEvent, .{ .task = task });
+                ztracy.FiberEnter(@ptrCast([*:0]const u8, &task.name[0]));
 
                 assert(task.state == .runnable);
                 task.state = .executing;
@@ -326,6 +330,9 @@ fn SchedulerImpl(comptime C: type) type {
                 .sibling = null,
             };
 
+            _ = std.fmt.bufPrintZ(&task.name, "task-{d}", .{tid}) catch
+                @panic("task name too long");
+
             // add the new task to the parent's list of child tasks
             if (parent) |pt| {
                 const node = &self.taskTree[pt];
@@ -394,6 +401,8 @@ fn SchedulerImpl(comptime C: type) type {
             assert(currentTaskId != null);
             const tid = currentTaskId.?;
             currentTaskId = null;
+
+            ztracy.FiberLeave();
 
             var task = &self.tasks[tid];
             assert(task.state == .executing);

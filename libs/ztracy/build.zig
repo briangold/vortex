@@ -14,6 +14,7 @@ pub fn link(exe: *std.build.LibExeObjStep, enable_tracy: bool) void {
         exe.addIncludeDir(thisDir() ++ "/libs/tracy");
         exe.addCSourceFile(thisDir() ++ "/libs/tracy/TracyClient.cpp", &.{
             "-DTRACY_ENABLE",
+            "-DTRACY_FIBERS", // TODO: add option to link()
             // MinGW doesn't have all the newfangled windows features,
             // so we need to pretend to have an older windows version.
             "-D_WIN32_WINNT=0x601",

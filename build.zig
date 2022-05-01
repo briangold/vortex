@@ -4,13 +4,14 @@ const ztracy = @import("libs/ztracy/build.zig");
 const Builder = std.build.Builder;
 const Step = std.build.Step;
 
-const pkgs = struct {
+pub fn getVortexPkg(deps: ?[]const std.build.Pkg) std.build.Pkg {
     const vortex = std.build.Pkg{
         .name = "vortex",
         .path = .{ .path = "src/vortex.zig" },
-        .dependencies = &[_]std.build.Pkg{},
+        .dependencies = deps,
     };
-};
+    return vortex;
+}
 
 fn addDemo(
     b: *Builder,
@@ -20,14 +21,11 @@ fn addDemo(
     const exe = b.addExecutable(demo.name, demo.path);
     exe.setTarget(options.target);
     exe.setBuildMode(options.mode);
-    exe.addPackage(pkgs.vortex);
+    exe.addOptions("build_options", options.exe_options);
 
-    const exe_options = b.addOptions();
-    exe_options.addOption(bool, "enable_tracy", options.enable_tracy);
-    exe.addOptions("build_options", exe_options);
-
-    const options_pkg = exe_options.getPackage("build_options");
-    exe.addPackage(ztracy.getPkg(b, options_pkg));
+    const tracy_pkg = ztracy.getPkg(b, options.options_pkg);
+    exe.addPackage(tracy_pkg);
+    exe.addPackage(getVortexPkg(&[_]std.build.Pkg{tracy_pkg}));
 
     ztracy.link(exe, options.enable_tracy);
 
@@ -46,7 +44,7 @@ fn addDemo(
 fn addFuzzer(b: *Builder, comptime fuzzer: anytype) !void {
     const fuzz_lib = b.addStaticLibrary(fuzzer.name ++ "-lib", fuzzer.path);
     fuzz_lib.setBuildMode(.Debug);
-    fuzz_lib.addPackage(pkgs.vortex);
+    fuzz_lib.addPackage(getVortexPkg(null)); // TODO: build a tracy package here?
     fuzz_lib.want_lto = true;
     fuzz_lib.bundle_compiler_rt = true;
 
@@ -83,7 +81,7 @@ fn addFuzzer(b: *Builder, comptime fuzzer: anytype) !void {
         fuzzer.path,
     );
     fuzz_debug_exe.setBuildMode(.Debug);
-    fuzz_debug_exe.addPackage(pkgs.vortex);
+    fuzz_debug_exe.addPackage(getVortexPkg(null)); // TODO: build tracy package here?
 
     // Only install fuzz-debug when the fuzz step is run
     const install_fuzz_debug_exe = b.addInstallArtifact(fuzz_debug_exe);
@@ -94,6 +92,10 @@ pub fn build(b: *Builder) !void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
     const enable_tracy = b.option(bool, "enable-tracy", "Enable Tracy profiler") orelse false;
+
+    const exe_options = b.addOptions();
+    exe_options.addOption(bool, "enable_tracy", enable_tracy);
+    const options_pkg = exe_options.getPackage("build_options");
 
     const demos = [_]struct {
         name: []const u8,
@@ -109,6 +111,8 @@ pub fn build(b: *Builder) !void {
             .target = target,
             .mode = mode,
             .enable_tracy = enable_tracy,
+            .exe_options = exe_options,
+            .options_pkg = options_pkg,
         });
     }
 
@@ -135,6 +139,7 @@ pub fn build(b: *Builder) !void {
 
     const main_tests = b.addTest("src/vortex.zig");
     main_tests.setBuildMode(mode);
+    main_tests.addPackage(ztracy.getPkg(b, options_pkg));
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&main_tests.step);

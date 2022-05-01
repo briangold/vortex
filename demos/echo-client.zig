@@ -2,6 +2,8 @@ const std = @import("std");
 const vx = @import("vortex").Vortex;
 const assert = std.debug.assert;
 
+const ztracy = @import("ztracy");
+
 const Timespec = vx.Timespec;
 const Histogram = vx.metrics.DefaultLog2HdrHistogram(Timespec);
 
