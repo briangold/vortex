@@ -1,6 +1,5 @@
 const std = @import("std");
 const vortex = @import("../vortex.zig");
-const net = @import("../network.zig");
 
 const alloc = std.testing.allocator;
 

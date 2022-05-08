@@ -4,6 +4,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Level = std.log.Level;
 
+const ztracy = @import("ztracy");
+
 const Timespec = @import("clock.zig").Timespec;
 
 pub const EventWriter = std.fs.File.Writer;
@@ -43,12 +45,10 @@ pub const Emitter = struct {
 
         const ev = Event.init(now, user);
 
-        self.sync_writer.mutex.lock();
-        defer self.sync_writer.mutex.unlock();
+        var buf: [4096]u8 = undefined;
+        var bw = std.io.fixedBufferStream(&buf);
 
-        var writer = self.sync_writer.writer;
-
-        writer.print("{d:>15} [{d:0>3}] {s:<9} {s:12} {s:16} ", .{
+        bw.writer().print("{d:>15} [{d:0>3}] {s:<9} {s:12} {s:16} ", .{
             ev.timestamp,
             tid,
             "(" ++ Event.level.asText() ++ ")",
@@ -57,17 +57,29 @@ pub const Emitter = struct {
         }) catch @panic("Unable to write event");
 
         if (std.meta.fields(Event.User).len > 0) {
-            writer.writeAll("- ") catch @panic("Unable to write event");
+            bw.writer().writeAll("- ") catch @panic("Unable to write event");
         }
 
         inline for (std.meta.fields(Event.User)) |f| {
-            writer.print("{s}={any} ", .{
+            bw.writer().print("{s}={any} ", .{
                 f.name,
                 @field(user, f.name),
             }) catch @panic("Unable to write event");
         }
 
-        writer.writeAll("\n") catch @panic("Unable to write event");
+        bw.writer().writeAll("\n") catch @panic("Unable to write event");
+
+        // Emit to tracy - a nop unless built with -Denable-tracy=true
+        ztracy.Message(bw.getWritten());
+
+        // Emit into sync_writer stream
+        {
+            self.sync_writer.mutex.lock();
+            defer self.sync_writer.mutex.unlock();
+
+            self.sync_writer.writer.writeAll(bw.getWritten()) catch
+                @panic("Unable to write to event stream");
+        }
     }
 };
 

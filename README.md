@@ -22,7 +22,7 @@ Run `zig build test` to run a series of unit tests. Among these unit tests,
 those in `src/tests` are against the public API and make for good examples. 
 
 Run `zig build list-demos` to see a list of complete demos that use the public
-API exclusively. Each can be run by `zig build demo-<name>`. 
+API exclusively. Each can be run by `zig build <name>`. 
 
 ## A TCP Echo Server ("Hello, World")
 

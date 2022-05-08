@@ -15,12 +15,12 @@
 const std = @import("std");
 const root = @import("root");
 
-const EventRegistry = @import("event.zig").EventRegistry;
+const EventRegistry = @import("src/event.zig").EventRegistry;
 
-const clock = @import("clock.zig");
-const metricslib = @import("metrics.zig");
-const network = @import("network.zig");
-const runtime = @import("runtime.zig");
+const clock = @import("src/clock.zig");
+const metricslib = @import("src/metrics.zig");
+const network = @import("src/network.zig");
+const runtime = @import("src/runtime.zig");
 
 pub const Vortex = if (@hasDecl(root, "Runtime"))
     VortexImpl(root.Runtime)

@@ -1,5 +1,5 @@
 const std = @import("std");
-const ztracy = @import("libs/ztracy/build.zig");
+const ztracy = @import("deps/ztracy/build.zig");
 
 const Builder = std.build.Builder;
 const Step = std.build.Step;
@@ -7,11 +7,19 @@ const Step = std.build.Step;
 pub fn getVortexPkg(deps: ?[]const std.build.Pkg) std.build.Pkg {
     const vortex = std.build.Pkg{
         .name = "vortex",
-        .path = .{ .path = "src/vortex.zig" },
+        .path = .{ .path = "vortex.zig" },
         .dependencies = deps,
     };
     return vortex;
 }
+
+const demo_pkgs = struct {
+    const clap = std.build.Pkg{
+        .name = "clap",
+        .path = .{ .path = "deps/zig-clap/clap.zig" },
+        .dependencies = &[_]std.build.Pkg{},
+    };
+};
 
 fn addDemo(
     b: *Builder,
@@ -25,20 +33,14 @@ fn addDemo(
 
     const tracy_pkg = ztracy.getPkg(b, options.options_pkg);
     exe.addPackage(tracy_pkg);
+    exe.addPackage(demo_pkgs.clap);
     exe.addPackage(getVortexPkg(&[_]std.build.Pkg{tracy_pkg}));
 
-    ztracy.link(exe, options.enable_tracy);
+    ztracy.link(exe, options.enable_tracy, .{ .fibers = true });
 
-    exe.install();
-
-    const run_cmd = exe.run();
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    const run_step = b.step("demo-" ++ demo.name, "Run " ++ demo.name);
-    run_step.dependOn(&run_cmd.step);
+    const install_exe = b.addInstallArtifact(exe);
+    const demo_step = b.step(demo.name, "Build " ++ demo.name ++ " demo");
+    demo_step.dependOn(&install_exe.step);
 }
 
 fn addFuzzer(b: *Builder, comptime fuzzer: anytype) !void {
@@ -103,7 +105,6 @@ pub fn build(b: *Builder) !void {
     }{
         .{ .name = "one", .path = "demos/one.zig" },
         .{ .name = "echo", .path = "demos/echo.zig" },
-        .{ .name = "echo-client", .path = "demos/echo-client.zig" },
     };
 
     inline for (demos) |demo| {
@@ -125,7 +126,7 @@ pub fn build(b: *Builder) !void {
         name: []const u8,
         path: []const u8,
     }{
-        .{ .name = "cancel", .path = "src/tests/cancel-fuzz.zig" },
+        .{ .name = "cancel", .path = "tests/cancel-fuzz.zig" },
     };
 
     inline for (fuzzers) |fuzzer| {
@@ -137,7 +138,7 @@ pub fn build(b: *Builder) !void {
 
     ////////////
 
-    const main_tests = b.addTest("src/vortex.zig");
+    const main_tests = b.addTest("vortex.zig");
     main_tests.setBuildMode(mode);
     main_tests.addPackage(ztracy.getPkg(b, options_pkg));
 
