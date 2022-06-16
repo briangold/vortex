@@ -19,16 +19,16 @@ you're new to Zig, see the [Zig getting started
 page](https://ziglang.org/learn/getting-started/).
 
 Run `zig build test` to run a series of unit tests. Among these unit tests,
-those in `src/tests` are against the public API and make for good examples. 
+those in `tests/` are against the public API and make for good examples. 
 
 Run `zig build list-demos` to see a list of complete demos that use the public
-API exclusively. Each can be run by `zig build <name>`. 
+API exclusively. Each can be built by `zig build <name>`. 
 
 ## A TCP Echo Server ("Hello, World")
 
 This code shows the core of a simple TCP echo server in Vortex. The [echo
-demo](demos/echo.zig) expands on this to include task-level timeouts and
-logging. To connect to the server, run `nc 127.0.0.1 8888` and type a message.
+demo](demos/echo.zig) expands on this and includes a concurrent client and
+server pair.
 
 ```zig
 fn session(stream: *vx.TcpStream) !void {
