@@ -15,6 +15,8 @@
 const std = @import("std");
 const root = @import("root");
 
+const ztracy = @import("ztracy");
+
 const EventRegistry = @import("src/event.zig").EventRegistry;
 
 const clock = @import("src/clock.zig");
@@ -131,6 +133,11 @@ fn VortexImpl(comptime R: type) type {
         /// Metrics tracking
         pub const metrics = struct {
             pub usingnamespace metricslib;
+        };
+
+        /// Tracing with tracy
+        pub const tracing = struct {
+            pub usingnamespace ztracy;
         };
 
         /// Event logging methods

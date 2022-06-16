@@ -394,7 +394,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                     var sqe = try op.loop.io_uring.recv(
                         @ptrToInt(op),
                         args.fd,
-                        args.buffer,
+                        .{ .buffer = args.buffer },
                         args.flags,
                     );
 

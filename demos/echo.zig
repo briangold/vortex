@@ -3,7 +3,6 @@ const vx = @import("vortex").Vortex;
 const assert = std.debug.assert;
 
 const clap = @import("clap");
-const ztracy = @import("ztracy");
 
 const Timespec = vx.Timespec;
 const Histogram = vx.metrics.DefaultLog2HdrHistogram(Timespec);
@@ -21,8 +20,8 @@ const Server = struct {
         defer server.alloc.free(buf);
 
         while (true) {
-            const tracy_zone = ztracy.ZoneNC(@src(), "Message handler", 0x00_ff_00_00);
-            defer tracy_zone.End();
+            const msg_zone = vx.tracing.ZoneNC(@src(), "Message handler", 0x00_ff_00_00);
+            defer msg_zone.End();
 
             // await a message from the client
             const rc = try stream.recv(buf, null);

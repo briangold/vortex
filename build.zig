@@ -3,11 +3,31 @@ const ztracy = @import("deps/ztracy/build.zig");
 
 const Builder = std.build.Builder;
 const Step = std.build.Step;
+const FileSource = std.build.FileSource;
 
-pub fn getVortexPkg(deps: ?[]const std.build.Pkg) std.build.Pkg {
+pub const VxBuildOptions = struct {
+    enable_tracy: bool = false,
+};
+
+pub fn addVortexPackage(
+    libexe: *std.build.LibExeObjStep,
+    options: VxBuildOptions,
+) void {
+    const b = libexe.builder;
+    const exe_options = b.addOptions();
+    exe_options.addOption(bool, "enable_tracy", options.enable_tracy);
+
+    const options_pkg = exe_options.getPackage("build_options");
+    const tracy_pkg = ztracy.getPkg(b, options_pkg);
+
+    libexe.addPackage(getVortexPkg(&[_]std.build.Pkg{tracy_pkg}));
+    ztracy.link(libexe, options.enable_tracy, .{ .fibers = true });
+}
+
+fn getVortexPkg(deps: ?[]const std.build.Pkg) std.build.Pkg {
     const vortex = std.build.Pkg{
         .name = "vortex",
-        .path = .{ .path = "vortex.zig" },
+        .source = FileSource.relative("vortex.zig"),
         .dependencies = deps,
     };
     return vortex;
@@ -16,7 +36,7 @@ pub fn getVortexPkg(deps: ?[]const std.build.Pkg) std.build.Pkg {
 const demo_pkgs = struct {
     const clap = std.build.Pkg{
         .name = "clap",
-        .path = .{ .path = "deps/zig-clap/clap.zig" },
+        .source = FileSource.relative("deps/zig-clap/clap.zig"),
         .dependencies = &[_]std.build.Pkg{},
     };
 };
@@ -27,16 +47,14 @@ fn addDemo(
     options: anytype,
 ) !void {
     const exe = b.addExecutable(demo.name, demo.path);
+
+    addVortexPackage(exe, .{
+        .enable_tracy = options.enable_tracy,
+    });
+
     exe.setTarget(options.target);
     exe.setBuildMode(options.mode);
-    exe.addOptions("build_options", options.exe_options);
-
-    const tracy_pkg = ztracy.getPkg(b, options.options_pkg);
-    exe.addPackage(tracy_pkg);
     exe.addPackage(demo_pkgs.clap);
-    exe.addPackage(getVortexPkg(&[_]std.build.Pkg{tracy_pkg}));
-
-    ztracy.link(exe, options.enable_tracy, .{ .fibers = true });
 
     const install_exe = b.addInstallArtifact(exe);
     const demo_step = b.step(demo.name, "Build " ++ demo.name ++ " demo");
@@ -95,10 +113,6 @@ pub fn build(b: *Builder) !void {
     const mode = b.standardReleaseOptions();
     const enable_tracy = b.option(bool, "enable-tracy", "Enable Tracy profiler") orelse false;
 
-    const exe_options = b.addOptions();
-    exe_options.addOption(bool, "enable_tracy", enable_tracy);
-    const options_pkg = exe_options.getPackage("build_options");
-
     const demos = [_]struct {
         name: []const u8,
         path: []const u8,
@@ -112,8 +126,6 @@ pub fn build(b: *Builder) !void {
             .target = target,
             .mode = mode,
             .enable_tracy = enable_tracy,
-            .exe_options = exe_options,
-            .options_pkg = options_pkg,
         });
     }
 
@@ -140,7 +152,12 @@ pub fn build(b: *Builder) !void {
 
     const main_tests = b.addTest("vortex.zig");
     main_tests.setBuildMode(mode);
-    main_tests.addPackage(ztracy.getPkg(b, options_pkg));
+
+    const test_opt = b.addOptions();
+    test_opt.addOption(bool, "enable_tracy", false);
+
+    const ztracy_pkg = ztracy.getPkg(b, test_opt.getPackage("build_options"));
+    main_tests.addPackage(ztracy_pkg);
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&main_tests.step);
