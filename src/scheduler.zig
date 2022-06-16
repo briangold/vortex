@@ -2,7 +2,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const FwdIndexedList = @import("list.zig").FwdIndexedList;
-const ConcurrentArrayQueue = @import("queue.zig").ConcurrentArrayQueue;
+const ConcurrentArrayQueue = @import("sync/queue.zig").ConcurrentArrayQueue;
+const LimitCounter = @import("sync/limit.zig").LimitCounter;
 
 const clock = @import("clock.zig");
 const Timespec = clock.Timespec;
@@ -130,7 +131,7 @@ fn SchedulerImpl(comptime C: type) type {
         const TaskId = Task.Index;
         const TaskList = FwdIndexedList(Task, .next);
         const SiblingList = FwdIndexedList(Task, .sibling);
-        const TaskQueue = ConcurrentArrayQueue(TaskId, .MPMC);
+        const TaskQueue = ConcurrentArrayQueue(TaskId);
 
         const TaskTreeNode = struct {
             children: SiblingList,
@@ -144,6 +145,7 @@ fn SchedulerImpl(comptime C: type) type {
 
         clock: *Clock,
         emitter: *Emitter,
+        admit: LimitCounter(usize),
         tasks: []Task,
         taskTree: []TaskTreeNode,
         free: TaskQueue,
@@ -163,6 +165,7 @@ fn SchedulerImpl(comptime C: type) type {
             var self = Scheduler{
                 .clock = clk,
                 .emitter = emitter,
+                .admit = LimitCounter(usize).init(config.max_tasks),
                 .tasks = tasks,
                 .taskTree = taskTree,
                 .free = try TaskQueue.init(alloc, config.max_tasks),
@@ -171,7 +174,7 @@ fn SchedulerImpl(comptime C: type) type {
 
             var idx: Task.Index = 0;
             while (idx < config.max_tasks) : (idx += 1) {
-                self.free.enqueue(idx) catch unreachable;
+                self.free.push(idx);
                 self.taskTree[idx] = TaskTreeNode{
                     .children = SiblingList.init(self.tasks),
                     .mutex = std.Thread.Mutex{},
@@ -190,12 +193,12 @@ fn SchedulerImpl(comptime C: type) type {
 
         /// Drives execution of runnable tasks. Returns the number of tasks that
         /// were advanced during this call.
-        /// TODO: pass in some kind of time budget? Currently runs all runnable 
+        /// TODO: pass in some kind of time budget? Currently runs all runnable
         /// tasks.
         pub fn tick(self: *Scheduler) usize {
             var count: usize = 0;
 
-            while (self.runqueue.dequeue()) |tid| : (count += 1) {
+            while (self.runqueue.try_pop()) |tid| : (count += 1) {
                 // Mark the start of a task fragment.
                 const start = self.clock.now();
 
@@ -315,7 +318,14 @@ fn SchedulerImpl(comptime C: type) type {
             parent: ?TaskId,
             timeout: Timespec,
         ) !TaskId {
-            const tid = self.free.dequeue() orelse return error.TooManyTasks;
+            // Admission control: ensure we have fewer than max tasks
+            if (self.admit.inc() == null)
+                return error.TooManyTasks;
+
+            // We are guaranteed to succeed with getting a tid, so we use the
+            // blocking pop() here. See the comments in the queue implementation
+            // for scenarios where blocking can occur. It should be rare.
+            const tid = self.free.pop();
 
             var task = &self.tasks[tid];
             task.* = Task{
@@ -363,7 +373,11 @@ fn SchedulerImpl(comptime C: type) type {
             }
 
             task.state = .empty;
-            self.free.enqueue(tid) catch unreachable;
+            self.free.push(tid);
+
+            // Admission control
+            if (self.admit.dec() == null)
+                @panic("Underflow on task count");
         }
 
         /// Sets up task `tid' to run from `frame'
@@ -373,10 +387,10 @@ fn SchedulerImpl(comptime C: type) type {
 
             task.state = .runnable;
             task.frame = frame;
-            self.runqueue.enqueue(tid) catch unreachable;
+            self.runqueue.push(tid);
         }
 
-        /// Internal helper: returns TaskCancelled if the currently running 
+        /// Internal helper: returns TaskCancelled if the currently running
         /// task was cancelled, or TaskTimeout if the task is over its deadline.
         fn propagateErrors(self: *Scheduler) !void {
             const task = &self.tasks[currentTaskId.?];
@@ -417,8 +431,8 @@ fn SchedulerImpl(comptime C: type) type {
         /// Reschedules a suspended task `tid'. This function is intended to be
         /// used as a callback from an I/O system when an operation issued by
         /// this task completes. It's also used in the SpawnHandle logic to
-        /// reschedule the caller of join(). 
-        /// 
+        /// reschedule the caller of join().
+        ///
         /// Note: when used as a callback for I/O, runs in the I/O thread
         /// context. When called from join(), runs in the task thread context.
         /// We may specialize this later to enqueue on different run queues
@@ -431,10 +445,10 @@ fn SchedulerImpl(comptime C: type) type {
             self.emitEvent(TaskRescheduledEvent, .{ .task = task });
 
             task.state = .runnable;
-            self.runqueue.enqueue(tid) catch unreachable;
+            self.runqueue.push(tid);
         }
 
-        /// Cancels task `tid'. If suspended for I/O operation, calls into 
+        /// Cancels task `tid'. If suspended for I/O operation, calls into
         /// EventLoop to cancel pending operation.
         fn cancelTask(self: *Scheduler, tid: TaskId) void {
             var task = &self.tasks[tid];
@@ -665,7 +679,7 @@ fn SchedulerImpl(comptime C: type) type {
             }
         }
 
-        /// Get the return type of a function. 
+        /// Get the return type of a function.
         /// Note: could extract for general use.
         fn FnReturn(comptime function: anytype) type {
             const info = @typeInfo(@TypeOf(function));
@@ -686,6 +700,7 @@ fn SchedulerImpl(comptime C: type) type {
                 @compileError("Mismatched anonymous struct fields");
 
             inline for (RF) |f| {
+                // NOTE: assignment also ensures safe coercion
                 @field(result, f.name) = @field(from, f.name);
             }
             return result;
