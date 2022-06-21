@@ -363,6 +363,42 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             try self.sched.suspendTask(interval, &op);
         }
 
+        /// Implements the I/O loop operations for a Futex. See the platform-
+        /// independent Futex library for more information.
+        pub const FutexEvent = struct {
+            op: IoOperation,
+
+            pub fn init(loop: *Loop) FutexEvent {
+                return FutexEvent{
+                    .op = IoOperation{
+                        .loop = loop,
+                        .opcode = .futex_wait,
+                    },
+                };
+            }
+
+            /// Waits for a wakeup event (no error) or the timeout to expire.
+            pub fn wait(tl: *FutexEvent, maybe_timeout: ?Timespec) !void {
+                const timeout = maybe_timeout orelse max_time;
+                try tl.op.loop.sched.suspendTask(timeout, &tl.op);
+
+                if (tl.op.completion.canceled) return error.Timeout;
+            }
+
+            /// Notifies the wait-half of this event
+            pub fn notify(tl: *FutexEvent) void {
+                // Note: we don't use op.cancel here as we are not canceling
+                // the operation, just the timeout.
+
+                // remove the timeout
+                _ = tl.op.loop.timers.unregTimeout(tl.op.idx) orelse
+                    @panic("No timer entry to cancel");
+
+                // wakeup the handler and free the entry
+                _ = tl.op.loop.wakeupEntry(tl.op.idx, false);
+            }
+        };
+
         const ScopedRegistry = EventRegistry("vx.io", enum {
             io_suspend,
             io_wake,
@@ -628,6 +664,7 @@ fn IoOperationImpl(comptime Loop: type) type {
 
         const Opcode = enum {
             sleep,
+            futex_wait,
             accept,
             connect,
             recv,
@@ -643,7 +680,7 @@ fn IoOperationImpl(comptime Loop: type) type {
 
         fn descriptor(op: *const Self) ?Descriptor {
             return switch (op.opcode) {
-                .sleep => null,
+                .sleep, .futex_wait => null,
                 else => op.fd,
             };
         }
@@ -680,7 +717,7 @@ fn IoOperationImpl(comptime Loop: type) type {
             op.loop.timers.regTimeout(idx);
 
             const rdy = switch (op.opcode) {
-                .sleep => Readiness.none,
+                .sleep, .futex_wait => Readiness.none,
                 .accept, .recv => Readiness.rd,
                 .connect, .send => Readiness.wr,
             };
@@ -807,7 +844,7 @@ fn TimeWheelImpl(
         }
 
         /// Find timeouts in the range (range.0, range.1], and move them
-        /// from the timer wheel onto the returned list. 
+        /// from the timer wheel onto the returned list.
         pub fn expireTimeouts(self: *Self, range: [2]Timespec) TimerList {
             const start = self.getSlotIndex(range[0]);
             const count = std.math.min(
@@ -841,9 +878,9 @@ fn TimeWheelImpl(
         }
 
         /// Find the next timeout in chronological order from `after'
-        /// Note: this is expensive as we store timers in unsorted lists 
-        /// and are thus forced to scan all timers. Only call this in 
-        /// specialized scenarios such as when simulating time with an 
+        /// Note: this is expensive as we store timers in unsorted lists
+        /// and are thus forced to scan all timers. Only call this in
+        /// specialized scenarios such as when simulating time with an
         /// autojump clock.
         pub fn nextTimeout(self: *const Self, after: Timespec) ?Timespec {
             var min_timeout: ?Timespec = null;
@@ -1007,7 +1044,7 @@ fn FileDescriptorTableImpl(
             return null;
         }
 
-        /// Removes and returns any pending entries that were waiting for 
+        /// Removes and returns any pending entries that were waiting for
         /// `kind' readiness.
         pub fn getEntries(
             self: *Self,

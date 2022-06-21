@@ -19,7 +19,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
     return struct {
         pub const Config = struct {
             /// Desired number of submission-queue entries. Must be a power-of-2
-            /// between 1 and 4096. 
+            /// between 1 and 4096.
             num_entries: u13 = 1024,
 
             /// Limit on how many completions can be reaped in a single call
@@ -263,6 +263,33 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             _ = try op.complete();
         }
 
+        /// Implements the I/O loop operations for a Futex. See the platform-
+        /// independent Futex library for more information.
+        pub const FutexEvent = struct {
+            op: IoOperation,
+
+            pub fn init(loop: *Loop) FutexEvent {
+                return FutexEvent{
+                    .op = IoOperation{
+                        .loop = loop,
+                        .args = .futex_wait,
+                    },
+                };
+            }
+
+            /// Waits for a wakeup event (no error) or the timeout to expire.
+            pub fn wait(tl: *FutexEvent, maybe_timeout: ?Timespec) !void {
+                const timeout = maybe_timeout orelse max_time;
+                try tl.op.loop.sched.suspendTask(timeout, &tl.op);
+                _ = try tl.op.complete();
+            }
+
+            /// Notifies the wait-half of this event, canceling the timeout
+            pub fn notify(tl: *FutexEvent) void {
+                tl.op.cancel();
+            }
+        };
+
         const ScopedRegistry = EventRegistry("vx.io", enum {
             io_suspend,
             io_wake,
@@ -300,6 +327,7 @@ fn IoOperationImpl(comptime Loop: type) type {
         // per-opcode arguments
         args: union(enum) {
             sleep, // reuse common timeout field
+            futex_wait,
             accept: struct {
                 listen_fd: Descriptor,
                 addr: *std.os.sockaddr,
@@ -346,7 +374,7 @@ fn IoOperationImpl(comptime Loop: type) type {
             op.loop.emitEvent(Loop.IoSuspendEvent, .{ .op = op });
 
             switch (op.args) {
-                .sleep => {
+                .sleep, .futex_wait => {
                     _ = try op.loop.io_uring.timeout(
                         @ptrToInt(op),
                         &op.timeout,
@@ -431,7 +459,19 @@ fn IoOperationImpl(comptime Loop: type) type {
                 .sleep => {
                     const ETIME = -@as(i32, @enumToInt(std.os.linux.E.TIME));
                     assert(op.completion.result == ETIME);
-                    return 0;
+                    return @as(usize, 0);
+                },
+
+                .futex_wait => {
+                    if (op.completion.result < 0) {
+                        return switch (@intToEnum(std.os.E, -op.completion.result)) {
+                            // We are getting ENOENT when removing the timeout.
+                            // TODO: diagnose why this isn't CANCELED as per documentation
+                            .CANCELED, .NOENT => @as(usize, 0),
+                            .TIME => error.Timeout,
+                            else => unreachable,
+                        };
+                    } else unreachable;
                 },
 
                 .accept => {
@@ -484,7 +524,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                         };
                     } else {
                         assert(op.completion.result == 0);
-                        return 0;
+                        return @as(usize, 0);
                     }
                 },
 
@@ -544,11 +584,25 @@ fn IoOperationImpl(comptime Loop: type) type {
             switch (op.args) {
                 // cancellable operations
                 .sleep,
+                .futex_wait,
+                => {
+                    // this queues the cancellation as a SQE, which will be
+                    // processed by the poll() loop like any other
+                    _ = op.loop.io_uring.timeout_remove(
+                        @ptrToInt(op),
+                        internal_cancel_userdata,
+                        0,
+                    ) catch |err| {
+                        std.debug.panic("timeout_remove failed: {s}", .{err});
+                    };
+                },
                 .accept,
                 .connect,
                 .recv,
                 .send,
                 => {
+                    // this queues the cancellation as a SQE, which will be
+                    // processed by the poll() loop like any other
                     _ = op.loop.io_uring.cancel(
                         @ptrToInt(op),
                         internal_cancel_userdata,
@@ -576,7 +630,7 @@ fn IoOperationImpl(comptime Loop: type) type {
             try writer.print("{s}", .{@tagName(op.args)});
 
             switch (op.args) {
-                .sleep => {},
+                .sleep, .futex_wait => {},
                 .accept => |args| {
                     try writer.print(" fd={d}", .{args.listen_fd});
                 },

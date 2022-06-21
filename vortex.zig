@@ -9,7 +9,7 @@
 //!   - timekeeping and task-safe waiting ('sleeping')
 //!   - network communication
 //!   - recording events into a log or other event stream
-//! 
+//!
 //! See the top-level README for more information and a feature roadmap.
 //!
 const std = @import("std");
@@ -23,6 +23,7 @@ const clock = @import("src/clock.zig");
 const metricslib = @import("src/metrics.zig");
 const network = @import("src/network.zig");
 const runtime = @import("src/runtime.zig");
+const Futex = @import("src/futex.zig").Futex;
 
 pub const Vortex = if (@hasDecl(root, "Runtime"))
     VortexImpl(root.Runtime)
@@ -110,7 +111,7 @@ fn VortexImpl(comptime R: type) type {
             pub const TcpListener = Network.Listener;
             pub const TcpStream = Network.Stream;
 
-            /// Start a listener socket at the given address. Call accept() on 
+            /// Start a listener socket at the given address. Call accept() on
             /// the returned TcpListener object to accept incoming connections.
             pub fn startTcpListener(
                 addr: std.net.Address,
@@ -128,6 +129,26 @@ fn VortexImpl(comptime R: type) type {
             ) TcpStream.ConnectError!TcpStream {
                 return TcpStream.connect(&_instance, target, timeout);
             }
+        };
+
+        /// Synchronization methods
+        pub const sync = struct {
+            const Atomic = std.atomic.Atomic;
+
+            /// Task-aware Futex primitive
+            pub const futex = struct {
+                pub fn wait(
+                    ptr: *const Atomic(u32),
+                    expect: u32,
+                    timeout: ?Timespec,
+                ) !void {
+                    return Futex(R).wait(&_instance, ptr, expect, timeout);
+                }
+
+                pub fn wake(ptr: *const Atomic(u32), max_waiters: usize) void {
+                    Futex(R).wake(&_instance, ptr, max_waiters);
+                }
+            };
         };
 
         /// Metrics tracking
@@ -190,4 +211,5 @@ test "api" {
     _ = @import("tests/task.zig"); // TODO: re-enable Sim tests
     _ = @import("tests/cancel.zig"); // TODO: re-enable Sim tests
     _ = @import("tests/tcp.zig");
+    _ = @import("tests/futex.zig");
 }
