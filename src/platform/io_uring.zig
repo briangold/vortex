@@ -465,9 +465,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                 .futex_wait => {
                     if (op.completion.result < 0) {
                         return switch (@intToEnum(std.os.E, -op.completion.result)) {
-                            // We are getting ENOENT when removing the timeout.
-                            // TODO: diagnose why this isn't CANCELED as per documentation
-                            .CANCELED, .NOENT => @as(usize, 0),
+                            .CANCELED => @as(usize, 0),
                             .TIME => error.Timeout,
                             else => unreachable,
                         };
@@ -589,8 +587,8 @@ fn IoOperationImpl(comptime Loop: type) type {
                     // this queues the cancellation as a SQE, which will be
                     // processed by the poll() loop like any other
                     _ = op.loop.io_uring.timeout_remove(
-                        @ptrToInt(op),
                         internal_cancel_userdata,
+                        @ptrToInt(op),
                         0,
                     ) catch |err| {
                         std.debug.panic("timeout_remove failed: {s}", .{err});
@@ -604,8 +602,8 @@ fn IoOperationImpl(comptime Loop: type) type {
                     // this queues the cancellation as a SQE, which will be
                     // processed by the poll() loop like any other
                     _ = op.loop.io_uring.cancel(
-                        @ptrToInt(op),
                         internal_cancel_userdata,
+                        @ptrToInt(op),
                         0,
                     ) catch |err| {
                         std.debug.panic("cancellation failed: {s}", .{err});
