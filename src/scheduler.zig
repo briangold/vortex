@@ -1,9 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 
 const FwdIndexedList = @import("list.zig").FwdIndexedList;
-const ConcurrentArrayQueue = @import("sync/queue.zig").ConcurrentArrayQueue;
-const LimitCounter = @import("sync/limit.zig").LimitCounter;
+const ConcurrentArrayQueue = @import("array_queue.zig").ConcurrentArrayQueue;
 
 const clock = @import("clock.zig");
 const Timespec = clock.Timespec;
@@ -27,54 +27,6 @@ pub const Config = struct {
 
 pub const DefaultScheduler = SchedulerImpl(clock.DefaultClock);
 pub const SimScheduler = SchedulerImpl(clock.SimClock);
-
-/// Interface for triggering an I/O cancellation. Implementations must provide
-/// a "cancel" method that represents an attempt at canceling a pending I/O
-/// operation that may still be outstanding. The caller cannot assume that
-/// the I/O will be cancelled in all cases. The platform implementing this
-/// cancellation must guarantee that the cancelled task will be resumed as
-/// part of either this cancellation or the I/O operation completing.
-pub const CancelToken = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        cancel: fn (ptr: *anyopaque) void,
-    };
-
-    pub fn init(
-        pointer: anytype,
-        comptime cancelFn: fn (@TypeOf(pointer)) void,
-    ) CancelToken {
-        const Ptr = @TypeOf(pointer);
-        const ptr_info = @typeInfo(Ptr);
-
-        assert(ptr_info == .Pointer); // Must be a pointer
-        assert(ptr_info.Pointer.size == .One); // Must be a single-item pointer
-
-        const alignment = ptr_info.Pointer.alignment;
-
-        const gen = struct {
-            fn cancelImpl(ptr: *anyopaque) void {
-                const self = @ptrCast(Ptr, @alignCast(alignment, ptr));
-                return @call(.{ .modifier = .always_inline }, cancelFn, .{self});
-            }
-
-            const vtable = VTable{
-                .cancel = cancelImpl,
-            };
-        };
-
-        return CancelToken{
-            .ptr = pointer,
-            .vtable = &gen.vtable,
-        };
-    }
-
-    pub inline fn cancel(self: CancelToken) void {
-        return self.vtable.cancel(self.ptr);
-    }
-};
 
 threadlocal var currentTaskId: ?Task.Index = null;
 
@@ -233,7 +185,7 @@ fn SchedulerImpl(comptime C: type) type {
                 // yielded the worker thread.
                 assert(currentTaskId == null);
 
-                self.emitEvent(TaskReturnEvent, .{
+                self.emitEvent(TaskYieldEvent, .{
                     .tid = tid,
                     .delta = end - start,
                 });
@@ -721,7 +673,7 @@ const ScopedRegistry = EventRegistry("vx.sched", enum {
     init_spawned,
     init_joined,
     task_resume,
-    task_return,
+    task_yield,
     task_spawned,
     task_joined,
     task_rescheduled,
@@ -735,7 +687,7 @@ const InitJoinedEvent = ScopedRegistry.register(.init_joined, .debug, struct {})
 const TaskResumeEvent = ScopedRegistry.register(.task_resume, .debug, struct {
     task: *Task,
 });
-const TaskReturnEvent = ScopedRegistry.register(.task_return, .debug, struct {
+const TaskYieldEvent = ScopedRegistry.register(.task_yield, .debug, struct {
     tid: Task.Index,
     delta: Timespec,
 });
@@ -890,4 +842,145 @@ test "Scheduler unit" {
 
     // The init task should be finished at this point
     try nosuspend await frame;
+}
+
+/// Interface for triggering an I/O cancellation. Implementations must provide
+/// a "cancel" method that represents an attempt at canceling a pending I/O
+/// operation that may still be outstanding. The caller cannot assume that
+/// the I/O will be cancelled in all cases. The platform implementing this
+/// cancellation must guarantee that the cancelled task will be resumed as
+/// part of either this cancellation or the I/O operation completing.
+pub const CancelToken = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        cancel: fn (ptr: *anyopaque) void,
+    };
+
+    pub fn init(
+        pointer: anytype,
+        comptime cancelFn: fn (@TypeOf(pointer)) void,
+    ) CancelToken {
+        const Ptr = @TypeOf(pointer);
+        const ptr_info = @typeInfo(Ptr);
+
+        assert(ptr_info == .Pointer); // Must be a pointer
+        assert(ptr_info.Pointer.size == .One); // Must be a single-item pointer
+
+        const alignment = ptr_info.Pointer.alignment;
+
+        const gen = struct {
+            fn cancelImpl(ptr: *anyopaque) void {
+                const self = @ptrCast(Ptr, @alignCast(alignment, ptr));
+                return @call(.{ .modifier = .always_inline }, cancelFn, .{self});
+            }
+
+            const vtable = VTable{
+                .cancel = cancelImpl,
+            };
+        };
+
+        return CancelToken{
+            .ptr = pointer,
+            .vtable = &gen.vtable,
+        };
+    }
+
+    pub inline fn cancel(self: CancelToken) void {
+        return self.vtable.cancel(self.ptr);
+    }
+};
+
+fn LimitCounter(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const Counter = T;
+        const AtomicCounter = std.atomic.Atomic(T);
+
+        val: AtomicCounter,
+        limit: Counter,
+
+        pub fn init(limit: Counter) Self {
+            return Self{
+                .val = AtomicCounter.init(0),
+                .limit = limit,
+            };
+        }
+
+        /// Increment counter, returning new value or null if already at limit
+        pub fn inc(lc: *Self) ?Counter {
+            while (true) {
+                const c = lc.val.load(.Monotonic);
+                if (c == lc.limit) return null;
+                if (lc.tryCAS(c, c + 1)) return c + 1;
+            }
+        }
+
+        /// Decrement counter, returning new value or null if already at 0
+        pub fn dec(lc: *Self) ?Counter {
+            while (true) {
+                const c = lc.val.load(.Monotonic);
+                if (c == 0) return null;
+                if (lc.tryCAS(c, c - 1)) return c - 1;
+            }
+        }
+
+        fn tryCAS(lc: *Self, exp: Counter, new: Counter) bool {
+            return lc.val.tryCompareAndSwap(exp, new, .Release, .Monotonic) == null;
+        }
+    };
+}
+
+test "LimitCounter single thread" {
+    var lc = LimitCounter(usize).init(2);
+    try std.testing.expectEqual(@as(?usize, 1), lc.inc());
+    try std.testing.expectEqual(@as(?usize, 2), lc.inc());
+    try std.testing.expectEqual(@as(?usize, null), lc.inc());
+
+    try std.testing.expectEqual(@as(?usize, 1), lc.dec());
+    try std.testing.expectEqual(@as(?usize, 0), lc.dec());
+    try std.testing.expectEqual(@as(?usize, null), lc.dec());
+}
+
+test "LimitCounter concurrent" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Limit = LimitCounter(usize);
+
+    const worker = struct {
+        fn run(lc: *Limit, id: usize, num_iter: usize) void {
+            // even threads increment, odd decrement
+            const fun = if (id % 2 == 0) Limit.inc else Limit.dec;
+
+            var i = num_iter;
+            while (i > 0) : (i -= 1) {
+                while (fun(lc) == null) {
+                    // not necessary, but randomizes schedule a bit
+                    std.time.sleep(0);
+                }
+            }
+        }
+    }.run;
+
+    const num_threads = 4;
+    const num_iter = 1000;
+
+    var lc = Limit.init(num_threads);
+
+    const alloc = std.testing.allocator;
+    var workers = try alloc.alloc(std.Thread, num_threads);
+    defer alloc.free(workers);
+
+    for (workers) |*w, i| {
+        w.* = try std.Thread.spawn(
+            .{},
+            worker,
+            .{ &lc, i, num_iter },
+        );
+    }
+
+    for (workers) |*w| {
+        w.join();
+    }
 }

@@ -10,7 +10,7 @@ const Atomic = std.atomic.Atomic;
 const Mutex = std.Thread.Mutex;
 const Treap = std.Treap(usize, std.math.order);
 
-const clock = @import("clock.zig");
+const clock = @import("../clock.zig");
 const Timespec = clock.Timespec;
 const max_time = clock.max_time;
 
@@ -78,22 +78,23 @@ pub fn Futex(comptime Runtime: type) type {
 
             // start waiting
             waiter.event.wait(interval) catch {
-                // If we fail to cancel after a timeout, it means a waker
-                // task dequeued us and will wake us up.  We must wait until
-                // the event is canceled as that's a signal that the waker
-                // wont access the waiter memory anymore. If we return early
-                // without waiting, the waiter on the stack would be invalidated
-                // and the waker task risks a UAF.
-                defer if (!cancelled) waiter.event.wait(null) catch unreachable;
+                {
+                    bucket.mutex.lock();
+                    defer bucket.mutex.unlock();
 
-                bucket.mutex.lock();
-                defer bucket.mutex.unlock();
+                    cancelled = WaitQueue.tryRemove(&bucket.treap, address, &waiter);
+                }
 
-                cancelled = WaitQueue.tryRemove(&bucket.treap, address, &waiter);
                 if (cancelled) {
                     return error.Timeout;
                 } else {
-                    waiter.event.wait(max_time) catch unreachable;
+                    // If we fail to cancel after a timeout, it means a waker task
+                    // dequeued us and will wake us up.  We must wait until the
+                    // event is canceled as that's a signal that the waker wont
+                    // access the waiter memory anymore. If we return early without
+                    // waiting, the waiter on the stack would be invalidated and the
+                    // waker task risks a UAF.
+                    waiter.event.wait(null) catch unreachable;
                 }
             };
         }

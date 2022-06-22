@@ -28,6 +28,6 @@ pub fn Config(comptime Runtime: type) type {
         },
 
         /// The logging level, using the std logging level definitions
-        log_level: std.log.Level = .info,
+        log_level: std.log.Level = .debug,
     };
 }

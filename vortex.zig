@@ -23,7 +23,6 @@ const clock = @import("src/clock.zig");
 const metricslib = @import("src/metrics.zig");
 const network = @import("src/network.zig");
 const runtime = @import("src/runtime.zig");
-const Futex = @import("src/futex.zig").Futex;
 
 pub const Vortex = if (@hasDecl(root, "Runtime"))
     VortexImpl(root.Runtime)
@@ -136,19 +135,24 @@ fn VortexImpl(comptime R: type) type {
             const Atomic = std.atomic.Atomic;
 
             /// Task-aware Futex primitive
-            pub const futex = struct {
+            pub const Futex = struct {
+                const FutexImpl = @import("src/sync/futex.zig").Futex;
+
                 pub fn wait(
                     ptr: *const Atomic(u32),
                     expect: u32,
                     timeout: ?Timespec,
                 ) !void {
-                    return Futex(R).wait(&_instance, ptr, expect, timeout);
+                    return FutexImpl(R).wait(&_instance, ptr, expect, timeout);
                 }
 
                 pub fn wake(ptr: *const Atomic(u32), max_waiters: usize) void {
-                    Futex(R).wake(&_instance, ptr, max_waiters);
+                    FutexImpl(R).wake(&_instance, ptr, max_waiters);
                 }
             };
+
+            /// Task-aware barrier synchronization
+            pub const Barrier = @import("src/sync/barrier.zig").Barrier(Futex);
         };
 
         /// Metrics tracking
@@ -212,4 +216,5 @@ test "api" {
     _ = @import("tests/cancel.zig"); // TODO: re-enable Sim tests
     _ = @import("tests/tcp.zig");
     _ = @import("tests/futex.zig");
+    _ = @import("tests/barrier.zig");
 }

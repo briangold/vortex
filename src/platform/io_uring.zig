@@ -20,7 +20,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         pub const Config = struct {
             /// Desired number of submission-queue entries. Must be a power-of-2
             /// between 1 and 4096.
-            num_entries: u13 = 1024,
+            num_entries: u13 = 4096,
 
             /// Limit on how many completions can be reaped in a single call
             /// to poll().
@@ -272,7 +272,9 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                 return FutexEvent{
                     .op = IoOperation{
                         .loop = loop,
-                        .args = .futex_wait,
+                        .args = .{ .futex_wait = .{
+                            .state = .{ .value = .empty },
+                        } },
                     },
                 };
             }
@@ -281,12 +283,38 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             pub fn wait(tl: *FutexEvent, maybe_timeout: ?Timespec) !void {
                 const timeout = maybe_timeout orelse max_time;
                 try tl.op.loop.sched.suspendTask(timeout, &tl.op);
+
                 _ = try tl.op.complete();
             }
 
             /// Notifies the wait-half of this event, canceling the timeout
             pub fn notify(tl: *FutexEvent) void {
-                tl.op.cancel();
+                const state = &tl.op.args.futex_wait.state;
+
+                // state transition loop - atomically transition:
+                //   empty   => notified :: the waiter will see notified
+                //   waiting => _        :: notify the waiter
+                while (true) {
+                    switch (state.load(.Acquire)) {
+                        .empty => {
+                            if (state.tryCompareAndSwap(
+                                .empty,
+                                .notified,
+                                .Release,
+                                .Monotonic,
+                            ) == null) {
+                                return;
+                            }
+                            // CAS failure - retry
+                        },
+                        .waiting => {
+                            // cancel waiting op
+                            tl.op.cancel();
+                            return;
+                        },
+                        .notified => unreachable,
+                    }
+                }
             }
         };
 
@@ -327,7 +355,10 @@ fn IoOperationImpl(comptime Loop: type) type {
         // per-opcode arguments
         args: union(enum) {
             sleep, // reuse common timeout field
-            futex_wait,
+            futex_wait: struct {
+                const State = enum(u8) { empty, waiting, notified };
+                state: std.atomic.Atomic(State),
+            },
             accept: struct {
                 listen_fd: Descriptor,
                 addr: *std.os.sockaddr,
@@ -374,13 +405,47 @@ fn IoOperationImpl(comptime Loop: type) type {
             op.loop.emitEvent(Loop.IoSuspendEvent, .{ .op = op });
 
             switch (op.args) {
-                .sleep, .futex_wait => {
+                .sleep => {
                     _ = try op.loop.io_uring.timeout(
                         @ptrToInt(op),
                         &op.timeout,
                         0, // count => wait independent of other events
                         0, // relative timeout
                     );
+                },
+
+                .futex_wait => |*args| {
+                    _ = try op.loop.io_uring.timeout(
+                        @ptrToInt(op),
+                        &op.timeout,
+                        0, // count => wait independent of other events
+                        0, // relative timeout
+                    );
+
+                    // state transition loop - atomically transition:
+                    //   empty    => waiting  :: the waker will see waiting
+                    //   notified => _        :: already notified, so cancel
+                    while (true) {
+                        switch (args.state.load(.Acquire)) {
+                            .empty => {
+                                if (args.state.tryCompareAndSwap(
+                                    .empty,
+                                    .waiting,
+                                    .Release,
+                                    .Monotonic,
+                                ) == null) {
+                                    return;
+                                }
+                                // CAS failure - retry
+                            },
+                            .waiting => unreachable,
+                            .notified => {
+                                // notification already arrived, cancel
+                                op.cancel();
+                                return;
+                            },
+                        }
+                    }
                 },
 
                 .accept => |*args| {
