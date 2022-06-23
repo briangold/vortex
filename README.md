@@ -93,6 +93,7 @@ optimizations](https://zig.news/kprotty/resource-efficient-thread-pools-with-zig
 - [x] Task model
   - [x] Spawning and joining
   - [x] Cancellation
+  - [ ] Select first task to complete, cancel others
 - [x] I/O Engine
   - [x] kqueue (Darwin)
   - [x] epoll (Linux)
@@ -107,6 +108,12 @@ optimizations](https://zig.news/kprotty/resource-efficient-thread-pools-with-zig
   - [x] Basic multi-threaded runtime
   - [ ] Idle thread efficiency (wait/notify)
   - [ ] Work stealing
+- [ ] Synchronization
+  - [x] Task-aware futex
+  - [x] Barriers
+  - [ ] Channels
+  - [ ] ResetEvent
+  - [ ] Mutex, RWLock
 - [ ] Demos and benchmarks
   - [x] TCP echo server
   - [x] Cancellation torture tests & fuzzing
@@ -125,6 +132,7 @@ optimizations](https://zig.news/kprotty/resource-efficient-thread-pools-with-zig
 - [ ] File APIs
   - [ ] posix by default, backed by thread pool
   - [ ] io_uring where possible
+- [ ] Signals
 
 ## Longer term
 
