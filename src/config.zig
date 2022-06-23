@@ -14,11 +14,11 @@ pub fn Config(comptime Runtime: type) type {
         /// Scheduler configuration
         scheduler: SchedulerConfig = SchedulerConfig{},
 
-        /// Number of dedicated task threads to spawn. If set to 0, the runtime is
-        /// configured to be single-threaded, where task execution shares time with the
-        /// I/O thread. When non-zero, the runtime will spawn that many worker threads
-        /// to schedule task execution across, and the I/O thread will only process
-        /// I/O events.
+        /// Number of dedicated task threads to spawn. If set to 0, the runtime
+        /// is configured to be single-threaded, where task execution shares
+        /// time with the I/O thread. When non-zero, the runtime will spawn that
+        /// many worker threads to schedule task execution across, and the I/O
+        /// thread will only process I/O events.
         task_threads: usize = 4,
 
         /// The synchronized `writer' object for writing event records (logs).
@@ -28,6 +28,6 @@ pub fn Config(comptime Runtime: type) type {
         },
 
         /// The logging level, using the std logging level definitions
-        log_level: std.log.Level = .debug,
+        log_level: std.log.Level = .info,
     };
 }
