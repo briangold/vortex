@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const Atomic = std.atomic.Atomic;
 
 const FwdIndexedList = @import("list.zig").FwdIndexedList;
 const ConcurrentArrayQueue = @import("array_queue.zig").ConcurrentArrayQueue;
@@ -39,6 +40,11 @@ const Task = struct {
         runnable, // the task is ready to run
         executing, // the task is being executed currently
         suspended, // the task has suspended itself
+        finished, // the task has completed
+
+        // NOTE: cancelled is orthogonal to the scheduler state, and is kept
+        // in a separate flag in the Task (below). When a task is cancelled,
+        // it may still be rescheduled to perform task-specific cleanup.
     };
 
     id: Index,
@@ -49,6 +55,10 @@ const Task = struct {
     frame: ?anyframe,
     io_token: ?CancelToken,
     cancelled: bool,
+
+    // Optional completion callback - only run if on_complete_ctx != 0
+    on_complete: fn (ctx: *anyopaque, tid: Index) void = undefined,
+    on_complete_ctx: Atomic(usize),
 
     next: ?Index, // link for free/run list
     sibling: ?Index, // link for children of a given parent
@@ -290,6 +300,7 @@ fn SchedulerImpl(comptime C: type) type {
                 .io_token = null,
                 .next = null,
                 .sibling = null,
+                .on_complete_ctx = Atomic(usize).init(0),
             };
 
             _ = std.fmt.bufPrintZ(&task.name, "task-{d}", .{tid}) catch
@@ -340,6 +351,48 @@ fn SchedulerImpl(comptime C: type) type {
             task.state = .runnable;
             task.frame = frame;
             self.runqueue.push(tid);
+        }
+
+        /// Finishes a task
+        fn finishTask(self: *Scheduler, tid: TaskId) void {
+            var task = &self.tasks[tid];
+            assert(task.state != .finished);
+
+            task.state = .finished;
+
+            // Run (optional) completion handler. We use the context as the
+            // atomic flag for whether a handler is installed.
+            const ctx = task.on_complete_ctx.load(.Acquire);
+            if (ctx != 0) {
+                task.on_complete(@intToPtr(*anyopaque, ctx), tid);
+            }
+        }
+
+        /// Set up (optional) task completion handler
+        fn setCompletion(
+            self: *Scheduler,
+            tid: TaskId,
+            comptime callback: anytype,
+            context: anytype,
+        ) void {
+            const Context = @TypeOf(context);
+
+            const wrap = struct {
+                fn inner(ptr: *anyopaque, id: TaskId) void {
+                    const alignment = @typeInfo(Context).Pointer.alignment;
+                    var ctx = @ptrCast(Context, @alignCast(alignment, ptr));
+                    callback(ctx, id);
+                }
+            }.inner;
+
+            var task = &self.tasks[tid];
+            assert(task.on_complete_ctx.load(.Monotonic) == 0);
+
+            // Ordering matters here: install the callback, then the context
+            // via an atomic write that is synchronized with the Acquire in
+            // finishTask()
+            task.on_complete = wrap;
+            task.on_complete_ctx.store(@ptrToInt(context), .Release);
         }
 
         /// Internal helper: returns TaskCancelled if the currently running
@@ -502,9 +555,7 @@ fn SchedulerImpl(comptime C: type) type {
                             _ = sched.descheduleCurrentTask(null);
                         }
 
-                        // the spawned task is done... free the resources that
-                        // were allocated in the SpawnHandle start() method.
-                        sched.freeTask(tid);
+                        sched.finishTask(tid);
                     }
 
                     // If the spawned task was cancelled or timed out before it
@@ -519,6 +570,7 @@ fn SchedulerImpl(comptime C: type) type {
 
             return struct {
                 const Frame = @Frame(launch);
+                pub const JoinResult = Widen;
 
                 started: bool = false,
                 frame: Frame = undefined,
@@ -576,7 +628,7 @@ fn SchedulerImpl(comptime C: type) type {
                     self.sched.cancelTask(self.tid);
                 }
 
-                pub fn join(self: *@This()) Widen {
+                pub fn join(self: *@This()) JoinResult {
                     assert(self.started);
 
                     // The task that's joining the spawned task goes async here,
@@ -585,6 +637,10 @@ fn SchedulerImpl(comptime C: type) type {
 
                     // Await the result from the spawned task
                     const res = await self.frame;
+
+                    // The spawned task is done... free the resources that
+                    // were allocated in spawnTask().
+                    self.sched.freeTask(self.tid);
 
                     // Take another trip through the scheduler. We could
                     // directly manipulate the scheduler state to put the caller
@@ -665,6 +721,146 @@ fn SchedulerImpl(comptime C: type) type {
         ) void {
             self.emitter.emit(self.clock.now(), threadId(), Event, user);
         }
+
+        /// Waits for one of several tasks to complete, and cancels all
+        /// others. Expects `spawn_handles` to be a struct with one field
+        /// per task handle, and returns a tagged union of the task return
+        /// types, tagged by the task that completed first.
+        pub fn select(
+            self: *Scheduler,
+            spawn_handles: anytype,
+        ) error{TaskCancelled}!SelectResultUnion(@TypeOf(spawn_handles)) {
+            const SpawnHandles = @TypeOf(spawn_handles);
+            const Result = SelectResultUnion(SpawnHandles);
+
+            const CompletionCtx = struct {
+                once: std.atomic.Atomic(u8),
+                handles: SpawnHandles,
+            };
+
+            const fields = std.meta.fields(SpawnHandles);
+
+            const on_complete = struct {
+                fn inner(ctx: *CompletionCtx, tid: Task.Index) void {
+                    // guard - only run this once
+                    if (ctx.once.fetchAdd(1, .SeqCst) > 0) return;
+
+                    // cancel all tasks that are not `tid'
+                    inline for (fields) |field| {
+                        const th = @field(ctx.handles, field.name);
+                        if (th.tid != tid) {
+                            th.cancel();
+                        }
+                    }
+                }
+            }.inner;
+
+            var completion_ctx = CompletionCtx{
+                .once = Atomic(u8).init(0),
+                .handles = spawn_handles,
+            };
+
+            // 1. Install completion callback
+            inline for (fields) |field| {
+                const th = @field(spawn_handles, field.name);
+                self.setCompletion(th.tid, on_complete, &completion_ctx);
+            }
+
+            // TODO: fairness amongst tasks that complete quickly. One way to
+            // do this would be a double loop, where we capture the loop index
+            // and test if index is > some random number in the range [0,
+            // fields.len) in the first loop, and <= that same number in the
+            // second loop. Needs a test case and a helper function to express
+            // the iteration?
+
+            // 2. Check spawned tasks for any already finished
+            inline for (fields) |field| {
+                const th = @field(spawn_handles, field.name);
+                const task = &th.sched.tasks[th.tid];
+                if (task.state == .finished) {
+                    // Manually run the completion, to close race where task
+                    // finishes prior to completion callback being installed.
+                    // This allows us to safely join() all threads below.
+                    on_complete(&completion_ctx, th.tid);
+                }
+            }
+
+            // 3. Join all spawned tasks
+            var res: ?Result = null;
+            inline for (fields) |field| {
+                const th = @field(spawn_handles, field.name);
+
+                if (th.join()) |r| {
+                    res = res orelse @unionInit(Result, field.name, r);
+                } else |err| switch (err) {
+                    error.TaskCancelled => {},
+                    else => {
+                        res = res orelse @unionInit(Result, field.name, err);
+                    },
+                }
+            }
+
+            return (res orelse error.TaskCancelled);
+        }
+
+        /// Reifies the return type of the select() function. Given a struct
+        /// where each field is a task SpawnHandle, returns a tagged union
+        /// where the Tag type is an enum of the field names and the union
+        /// fields are the Task return types. Whichever task completes the
+        /// select operation will become the active tag in this result.
+        pub fn SelectResultUnion(comptime SpawnSet: type) type {
+            const set_info = @typeInfo(SpawnSet);
+            if (set_info != .Struct)
+                @compileError("select() must be passed a struct");
+
+            const fields = std.meta.fields(SpawnSet);
+
+            const UnionField = std.builtin.Type.UnionField;
+            const EnumField = std.builtin.Type.EnumField;
+            var union_fields: []const UnionField = &[_]UnionField{};
+            var enum_fields: []const EnumField = &[_]EnumField{};
+
+            inline for (fields) |field, i| {
+                const ti = @typeInfo(field.field_type);
+                if (ti != .Pointer or ti.Pointer.size != .One)
+                    @compileError("select() fields must be *SpawnHandle");
+
+                const R = ti.Pointer.child.JoinResult;
+
+                enum_fields = enum_fields ++ &[_]EnumField{.{
+                    .name = field.name,
+                    .value = i,
+                }};
+
+                union_fields = union_fields ++ &[_]UnionField{.{
+                    .name = field.name,
+                    .field_type = R,
+                    .alignment = if (@sizeOf(R) > 0) @alignOf(R) else 0,
+                }};
+            }
+
+            const enum_type = @Type(.{
+                .Enum = .{
+                    .layout = .Auto,
+                    .tag_type = std.math.IntFittingRange(0, fields.len - 1),
+                    .fields = enum_fields,
+                    .decls = &.{},
+                    .is_exhaustive = true,
+                },
+            });
+
+            // See https://github.com/zig/ziglang/issues/8114
+            const uti = .{
+                .Union = .{
+                    .layout = .Auto,
+                    .tag_type = enum_type,
+                    .fields = union_fields,
+                    .decls = &.{},
+                },
+            };
+
+            return @Type(uti);
+        }
     };
 }
 
@@ -739,6 +935,10 @@ test "Scheduler unit" {
             // do nothing
         }
 
+        fn on_child_complete(sched: *Scheduler, tid: Task.Index) void {
+            assert(sched.tasks[tid].state == .finished);
+        }
+
         fn asyncChild(sched: *Scheduler) !void {
             var op = MockOp{};
             try sched.suspendTask(0, &op);
@@ -764,6 +964,9 @@ test "Scheduler unit" {
             // spawn a child task
             var ch: Scheduler.SpawnHandle(child) = undefined;
             try sched.spawnTask(&ch, .{sched}, clock.max_time);
+
+            // install a completion handler
+            sched.setCompletion(ch.tid, on_child_complete, sched);
 
             // wait for the child to complete
             try ch.join();
@@ -896,7 +1099,7 @@ fn LimitCounter(comptime T: type) type {
     return struct {
         const Self = @This();
         const Counter = T;
-        const AtomicCounter = std.atomic.Atomic(T);
+        const AtomicCounter = Atomic(T);
 
         val: AtomicCounter,
         limit: Counter,

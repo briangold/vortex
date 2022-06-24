@@ -85,6 +85,16 @@ fn VortexImpl(comptime R: type) type {
                 const timeout = if (req_timeout) |t| t else clock.max_time;
                 return _instance.sched.spawnTask(spawnHandlePtr, args, timeout);
             }
+
+            /// Waits for one of several tasks to complete, and cancels all
+            /// others. Expects `spawn_handles` to be a struct with one field
+            /// per task handle, and returns a tagged union of the task return
+            /// types, tagged by the task that completed first.
+            pub fn select(
+                spawn_handles: anytype,
+            ) error{TaskCancelled}!Scheduler.SelectResultUnion(@TypeOf(spawn_handles)) {
+                return _instance.sched.select(spawn_handles);
+            }
         };
 
         /// Timekeeping methods
@@ -217,4 +227,5 @@ test "api" {
     _ = @import("tests/tcp.zig");
     _ = @import("tests/futex.zig");
     _ = @import("tests/barrier.zig");
+    _ = @import("tests/select.zig");
 }

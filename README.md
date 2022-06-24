@@ -93,7 +93,7 @@ optimizations](https://zig.news/kprotty/resource-efficient-thread-pools-with-zig
 - [x] Task model
   - [x] Spawning and joining
   - [x] Cancellation
-  - [ ] Select first task to complete, cancel others
+  - [x] select API to choose among several tasks
 - [x] I/O Engine
   - [x] kqueue (Darwin)
   - [x] epoll (Linux)
