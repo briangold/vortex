@@ -15,8 +15,8 @@ pub fn threadId() usize {
     return thread_id;
 }
 
-pub const SimRuntime = RuntimeImpl(platform.SimIoLoop);
-pub const DefaultRuntime = RuntimeImpl(platform.DefaultLoop);
+pub const SimRuntime = RuntimeImpl(platform.SimPlatform);
+pub const DefaultRuntime = RuntimeImpl(platform.DefaultPlatform);
 
 pub fn RuntimeImpl(comptime Loop: type) type {
     return struct {

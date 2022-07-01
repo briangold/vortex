@@ -16,7 +16,7 @@ const internal_timeout_userdata = std.math.maxInt(usize);
 const internal_cancel_userdata = std.math.maxInt(usize) - 1;
 const internal_link_timeout_userdata = std.math.maxInt(usize) - 2;
 
-pub fn LoopFactory(comptime Scheduler: type) type {
+pub fn IoUringPlatform(comptime Scheduler: type) type {
     return struct {
         pub const Config = struct {
             /// Desired number of submission-queue entries. Must be a power-of-2
@@ -31,9 +31,9 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         pub const Descriptor = std.os.fd_t;
         pub const Scheduler = Scheduler;
 
-        const Loop = @This();
+        const Platform = @This();
 
-        const IoOperation = IoOperationImpl(Loop);
+        const IoOperation = IoOperationImpl(Platform);
         const IoCompletion = IoOperation.IoCompletion;
 
         clock: *Scheduler.Clock,
@@ -51,13 +51,13 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             config: Config,
             sched: *Scheduler,
             emitter: *Emitter,
-        ) InitError!Loop {
+        ) InitError!Platform {
             // If we want to support additional flags, we should expose them
             // as discrete config options/enum choices, then convert to the
             // bitfield flags here. For now the defaults are fine.
             const io_uring_flags: u32 = 0;
 
-            return Loop{
+            return Platform{
                 .clock = sched.clock,
                 .sched = sched,
                 .emitter = emitter,
@@ -74,16 +74,16 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             };
         }
 
-        pub fn deinit(self: *Loop, alloc: std.mem.Allocator) void {
-            self.io_uring.deinit();
-            alloc.free(self.events);
+        pub fn deinit(platform: *Platform, alloc: std.mem.Allocator) void {
+            platform.io_uring.deinit();
+            alloc.free(platform.events);
         }
 
         /// Polls for event completions, triggering the registered wakeup
         /// callback (typically to reschedule a task for continued execution).
         /// Waits up to `timeout' nanoseconds for a completion. Returns the
         /// number of completions handled.
-        pub fn poll(self: *Loop, timeout_ns: Timespec) !usize {
+        pub fn poll(platform: *Platform, timeout_ns: Timespec) !usize {
             // Prep an internal timeout to limit how long we wait for a
             // completion NOTE: we use relative timeouts here and are expressing
             // the delay in whatever form of clock the kernel uses
@@ -94,7 +94,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                 .tv_nsec = @intCast(isize, timeout_ns),
             };
 
-            _ = self.io_uring.timeout(
+            _ = platform.io_uring.timeout(
                 internal_timeout_userdata,
                 &timeout_spec,
                 1, // count => don't set res to -ETIME if we get a completion
@@ -104,18 +104,18 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             };
 
             // submit all pending sqes and wait for one (worst case, our timeout)
-            _ = self.io_uring.submit_and_wait(1) catch |err| {
+            _ = platform.io_uring.submit_and_wait(1) catch |err| {
                 std.debug.panic("Unable to submit_and_wait: {}\n", .{err});
             };
 
-            const completed = self.io_uring.copy_cqes(self.events, 0) catch |err| {
+            const completed = platform.io_uring.copy_cqes(platform.events, 0) catch |err| {
                 std.debug.panic("Unable to copy_cqes: {}\n", .{err});
             };
 
             var user_events: usize = 0;
             var i: usize = 0;
             while (i < completed) : (i += 1) {
-                const cqe = &self.events[i];
+                const cqe = &platform.events[i];
 
                 switch (cqe.user_data) {
                     0 => {
@@ -134,14 +134,14 @@ pub fn LoopFactory(comptime Scheduler: type) type {
 
                     else => {
                         user_events += 1;
-                        self.pending -= 1;
+                        platform.pending -= 1;
 
                         const op = @intToPtr(*IoOperation, cqe.user_data);
 
                         // stuff the result into our user-visible completion
                         op.completion.result = cqe.res;
 
-                        self.emitEvent(IoWakeEvent, .{ .op = op });
+                        platform.emitEvent(IoWakeEvent, .{ .op = op });
 
                         // wake the callback
                         op.completion.callback(
@@ -152,7 +152,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                 }
             }
 
-            var to_cancel = self.cancelq.unlink();
+            var to_cancel = platform.cancelq.unlink();
             while (to_cancel.get()) |op| {
                 switch (op.args) {
                     // cancellable operations
@@ -161,7 +161,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     => {
                         // this queues the cancellation as a SQE, which will be
                         // processed by the poll() loop like any other
-                        _ = self.io_uring.timeout_remove(
+                        _ = platform.io_uring.timeout_remove(
                             internal_cancel_userdata,
                             @ptrToInt(op),
                             0,
@@ -176,7 +176,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     => {
                         // this queues the cancellation as a SQE, which will be
                         // processed by the poll() loop like any other
-                        _ = self.io_uring.cancel(
+                        _ = platform.io_uring.cancel(
                             internal_cancel_userdata,
                             @ptrToInt(op),
                             0,
@@ -192,16 +192,16 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             return user_events;
         }
 
-        pub fn hasPending(self: *Loop) bool {
-            return self.pending != 0;
+        pub fn hasPending(platform: *Platform) bool {
+            return platform.pending != 0;
         }
 
         fn emitEvent(
-            self: *Loop,
+            platform: *Platform,
             comptime Event: type,
             user: Event.User,
         ) void {
-            self.emitter.emit(self.clock.now(), threadId(), Event, user);
+            platform.emitter.emit(platform.clock.now(), threadId(), Event, user);
         }
 
         const posix = @import("posix_sockets.zig");
@@ -216,7 +216,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         pub const getsockopt = posix.getsockopt;
 
         pub fn accept(
-            self: *Loop,
+            platform: *Platform,
             listen_fd: Descriptor,
             addr: *std.os.sockaddr,
             addrlen: *std.os.socklen_t,
@@ -224,7 +224,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             timeout: Timespec,
         ) !Descriptor {
             var op = IoOperation{
-                .loop = self,
+                .platform = platform,
                 .args = .{
                     .accept = .{
                         .listen_fd = listen_fd,
@@ -234,19 +234,19 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     },
                 },
             };
-            try self.sched.suspendTask(timeout, &op);
+            try platform.sched.suspendTask(timeout, &op);
             return @intCast(Descriptor, try op.complete());
         }
 
         pub fn connect(
-            self: *Loop,
+            platform: *Platform,
             fd: Descriptor,
             addr: *std.os.sockaddr,
             addrlen: std.os.socklen_t,
             timeout: Timespec,
         ) !Descriptor {
             var op = IoOperation{
-                .loop = self,
+                .platform = platform,
                 .args = .{
                     .connect = .{
                         .fd = fd,
@@ -255,19 +255,19 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     },
                 },
             };
-            try self.sched.suspendTask(timeout, &op);
+            try platform.sched.suspendTask(timeout, &op);
             return @intCast(Descriptor, try op.complete());
         }
 
         pub fn recv(
-            self: *Loop,
+            platform: *Platform,
             fd: Descriptor,
             buffer: []u8,
             flags: u32,
             timeout: Timespec,
         ) !usize {
             var op = IoOperation{
-                .loop = self,
+                .platform = platform,
                 .args = .{
                     .recv = .{
                         .fd = fd,
@@ -276,19 +276,19 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     },
                 },
             };
-            try self.sched.suspendTask(timeout, &op);
+            try platform.sched.suspendTask(timeout, &op);
             return op.complete();
         }
 
         pub fn send(
-            self: *Loop,
+            platform: *Platform,
             fd: Descriptor,
             buffer: []const u8,
             flags: u32,
             timeout: Timespec,
         ) !usize {
             var op = IoOperation{
-                .loop = self,
+                .platform = platform,
                 .args = .{
                     .send = .{
                         .fd = fd,
@@ -297,28 +297,28 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     },
                 },
             };
-            try self.sched.suspendTask(timeout, &op);
+            try platform.sched.suspendTask(timeout, &op);
             return op.complete();
         }
 
-        pub fn sleep(self: *Loop, interval: Timespec) !void {
+        pub fn sleep(platform: *Platform, interval: Timespec) !void {
             var op = IoOperation{
-                .loop = self,
+                .platform = platform,
                 .args = .sleep,
             };
-            try self.sched.suspendTask(interval, &op);
+            try platform.sched.suspendTask(interval, &op);
             _ = try op.complete();
         }
 
-        /// Implements the I/O loop operations for a Futex. See the platform-
+        /// Implements the I/O operations for a Futex. See the platform-
         /// independent Futex library for more information.
         pub const FutexEvent = struct {
             op: IoOperation,
 
-            pub fn init(loop: *Loop) FutexEvent {
+            pub fn init(platform: *Platform) FutexEvent {
                 return FutexEvent{
                     .op = IoOperation{
-                        .loop = loop,
+                        .platform = platform,
                         .args = .{ .futex_wait = .{
                             .state = .{ .value = .empty },
                         } },
@@ -329,7 +329,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             /// Waits for a wakeup event (no error) or the timeout to expire.
             pub fn wait(tl: *FutexEvent, maybe_timeout: ?Timespec) !void {
                 const timeout = maybe_timeout orelse max_time;
-                try tl.op.loop.sched.suspendTask(timeout, &tl.op);
+                try tl.op.platform.sched.suspendTask(timeout, &tl.op);
 
                 _ = try tl.op.complete();
             }
@@ -395,11 +395,11 @@ pub fn LoopFactory(comptime Scheduler: type) type {
     };
 }
 
-fn IoOperationImpl(comptime Loop: type) type {
+fn IoOperationImpl(comptime Platform: type) type {
     return struct {
-        const Self = @This();
+        const IoOperation = @This();
 
-        const Descriptor = Loop.Descriptor;
+        const Descriptor = Platform.Descriptor;
         const IoCompletion = struct {
             result: i32 = 0,
             callback: fn (*anyopaque, usize) void,
@@ -408,10 +408,10 @@ fn IoOperationImpl(comptime Loop: type) type {
         };
 
         // common elements
-        loop: *Loop,
+        platform: *Platform,
         completion: IoCompletion = undefined,
         timeout: std.os.linux.kernel_timespec = undefined,
-        cancel_next: ?*Self = null, // cancel queue linkage
+        cancel_next: ?*IoOperation = null, // cancel queue linkage
 
         // per-opcode arguments
         args: union(enum) {
@@ -444,7 +444,7 @@ fn IoOperationImpl(comptime Loop: type) type {
         },
 
         pub fn prep(
-            op: *Self,
+            op: *IoOperation,
             timeout: Timespec,
             comptime callback: anytype,
             callback_ctx: anytype,
@@ -461,13 +461,13 @@ fn IoOperationImpl(comptime Loop: type) type {
                 .callback_data = callback_data,
             };
 
-            op.loop.pending += 1;
+            op.platform.pending += 1;
 
-            op.loop.emitEvent(Loop.IoSuspendEvent, .{ .op = op });
+            op.platform.emitEvent(Platform.IoSuspendEvent, .{ .op = op });
 
             switch (op.args) {
                 .sleep => {
-                    _ = try op.loop.io_uring.timeout(
+                    _ = try op.platform.io_uring.timeout(
                         @ptrToInt(op),
                         &op.timeout,
                         0, // count => wait independent of other events
@@ -476,7 +476,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                 },
 
                 .futex_wait => |*args| {
-                    _ = try op.loop.io_uring.timeout(
+                    _ = try op.platform.io_uring.timeout(
                         @ptrToInt(op),
                         &op.timeout,
                         0, // count => wait independent of other events
@@ -515,7 +515,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                 },
 
                 .accept => |*args| {
-                    var sqe = try op.loop.io_uring.accept(
+                    var sqe = try op.platform.io_uring.accept(
                         @ptrToInt(op),
                         args.listen_fd,
                         args.addr,
@@ -525,7 +525,7 @@ fn IoOperationImpl(comptime Loop: type) type {
 
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.loop.io_uring.link_timeout(
+                    _ = try op.platform.io_uring.link_timeout(
                         internal_link_timeout_userdata,
                         &op.timeout,
                         0, // relative timeout
@@ -533,7 +533,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                 },
 
                 .connect => |*args| {
-                    var sqe = try op.loop.io_uring.connect(
+                    var sqe = try op.platform.io_uring.connect(
                         @ptrToInt(op),
                         args.fd,
                         args.addr,
@@ -542,7 +542,7 @@ fn IoOperationImpl(comptime Loop: type) type {
 
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.loop.io_uring.link_timeout(
+                    _ = try op.platform.io_uring.link_timeout(
                         internal_link_timeout_userdata,
                         &op.timeout,
                         0, // relative timeout
@@ -550,7 +550,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                 },
 
                 .recv => |*args| {
-                    var sqe = try op.loop.io_uring.recv(
+                    var sqe = try op.platform.io_uring.recv(
                         @ptrToInt(op),
                         args.fd,
                         .{ .buffer = args.buffer },
@@ -559,7 +559,7 @@ fn IoOperationImpl(comptime Loop: type) type {
 
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.loop.io_uring.link_timeout(
+                    _ = try op.platform.io_uring.link_timeout(
                         internal_link_timeout_userdata,
                         &op.timeout,
                         0, // relative timeout
@@ -567,7 +567,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                 },
 
                 .send => |*args| {
-                    var sqe = try op.loop.io_uring.send(
+                    var sqe = try op.platform.io_uring.send(
                         @ptrToInt(op),
                         args.fd,
                         args.buffer,
@@ -576,7 +576,7 @@ fn IoOperationImpl(comptime Loop: type) type {
 
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.loop.io_uring.link_timeout(
+                    _ = try op.platform.io_uring.link_timeout(
                         internal_link_timeout_userdata,
                         &op.timeout,
                         0, // relative timeout
@@ -585,7 +585,7 @@ fn IoOperationImpl(comptime Loop: type) type {
             }
         }
 
-        pub fn complete(op: *Self) !usize {
+        pub fn complete(op: *IoOperation) !usize {
             switch (op.args) {
                 .sleep => {
                     const ETIME = -@as(i32, @enumToInt(std.os.linux.E.TIME));
@@ -716,17 +716,17 @@ fn IoOperationImpl(comptime Loop: type) type {
             }
         }
 
-        fn cancel(op: *Self) void {
-            op.loop.emitEvent(Loop.IoCancelEvent, .{ .op = op });
-            op.loop.cancelq.insert(op);
+        fn cancel(op: *IoOperation) void {
+            op.platform.emitEvent(Platform.IoCancelEvent, .{ .op = op });
+            op.platform.cancelq.insert(op);
         }
 
-        pub fn cancelToken(op: *Self) CancelToken {
+        pub fn cancelToken(op: *IoOperation) CancelToken {
             return CancelToken.init(op, cancel);
         }
 
         pub fn format(
-            op: *const Self,
+            op: *const IoOperation,
             comptime fmt: []const u8,
             options: std.fmt.FormatOptions,
             writer: anytype,
@@ -755,7 +755,7 @@ fn IoOperationImpl(comptime Loop: type) type {
             if (op.timeout.tv_nsec == max_time) {
                 try writer.writeAll(" deadline=inf");
             } else {
-                const abs_timeout = op.loop.clock.now() + op.timeout.tv_nsec;
+                const abs_timeout = op.platform.clock.now() + op.timeout.tv_nsec;
                 try writer.print(" deadline={d}", .{abs_timeout});
             }
         }

@@ -21,7 +21,7 @@ const Poller = switch (target.os.tag) {
 
 const Index = u32; // indexes events in internal lists
 
-pub fn LoopFactory(comptime Scheduler: type) type {
+pub fn ReactorPlatform(comptime Scheduler: type) type {
     const Entry = struct {
         next: ?Index = null, // primary linkage (free list, per-fd, etc.)
         next_to: ?Index = null, // used by timewheel ordering
@@ -29,10 +29,10 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         timeout: Timespec = undefined,
         op: *anyopaque = undefined, // TODO: document further
 
-        fn getOp(self: *@This(), comptime Op: type) *Op {
+        fn getOp(entry: *@This(), comptime Op: type) *Op {
             return @ptrCast(
                 *Op,
-                @alignCast(@alignOf(Op), self.op),
+                @alignCast(@alignOf(Op), entry.op),
             );
         }
     };
@@ -71,12 +71,12 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         pub const Scheduler = Scheduler;
         const Clock = Scheduler.Clock;
 
-        const Loop = @This();
+        const Platform = @This();
 
         const OpList = FwdIndexedList(Entry, .next);
         const TimeWheel = TimeWheelImpl(Entry, .next_to);
         const FileDescriptorTable = FileDescriptorTableImpl(Entry, .next);
-        const IoOperation = IoOperationImpl(Loop);
+        const IoOperation = IoOperationImpl(Platform);
         const IoStatus = enum {
             invalid,
             success,
@@ -84,12 +84,12 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             canceled,
 
             pub fn format(
-                self: IoStatus,
+                status: IoStatus,
                 comptime _: []const u8,
                 _: std.fmt.FormatOptions,
                 writer: anytype,
             ) !void {
-                try writer.print("{s}", .{@tagName(self)});
+                try writer.print("{s}", .{@tagName(status)});
             }
         };
 
@@ -113,14 +113,14 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             config: Config,
             sched: *Scheduler,
             emitter: *Emitter,
-        ) InitError!Loop {
+        ) InitError!Platform {
             // TODO: check that Index fits based on max_events
             assert(std.math.isPowerOfTwo(config.max_events));
             assert(config.max_poll_events <= config.max_events);
 
             const entries = try alloc.alloc(Entry, config.max_events);
 
-            var self = Loop{
+            var platform = Platform{
                 .sched = sched,
                 .emitter = emitter,
                 .clock = sched.clock,
@@ -146,66 +146,66 @@ pub fn LoopFactory(comptime Scheduler: type) type {
 
             var idx: Index = 0;
             while (idx < config.max_events) : (idx += 1) {
-                self.free.push(idx);
+                platform.free.push(idx);
             }
 
-            return self;
+            return platform;
         }
 
-        pub fn deinit(self: *Loop, alloc: std.mem.Allocator) void {
-            self.fdt.deinit(alloc);
-            self.timers.deinit(alloc);
-            self.poller.deinit();
+        pub fn deinit(platform: *Platform, alloc: std.mem.Allocator) void {
+            platform.fdt.deinit(alloc);
+            platform.timers.deinit(alloc);
+            platform.poller.deinit();
 
-            alloc.free(self.events);
-            alloc.free(self.entries);
+            alloc.free(platform.events);
+            alloc.free(platform.entries);
         }
 
         /// Polls for event completions, triggering the registered wakeup
         /// callback (typically to reschedule a task for continued execution).
         /// Waits up to `timeout' nanoseconds for a completion. Returns the
         /// number of completions handled.
-        pub fn poll(self: *Loop, timeout_ns: Timespec) !usize {
+        pub fn poll(platform: *Platform, timeout_ns: Timespec) !usize {
             var count: usize = 0;
 
             // Process expired timeouts
-            const now = self.clock.now();
-            defer self.prevTime = now; // set up for next call to enter()
+            const now = platform.clock.now();
+            defer platform.prevTime = now; // set up for next call to enter()
 
-            var expired = self.timers.expireTimeouts(.{ self.prevTime, now });
+            var expired = platform.timers.expireTimeouts(.{ platform.prevTime, now });
             while (expired.pop()) |idx| {
-                const entry = &self.entries[idx];
+                const entry = &platform.entries[idx];
 
                 // remove the expired entry from FDT list and wake callback
                 const op = entry.getOp(IoOperation);
                 if (op.descriptor()) |fd| {
-                    _ = self.fdt.cancelEntry(
+                    _ = platform.fdt.cancelEntry(
                         idx,
                         fd,
                     ) orelse @panic("No fdt entry to expire");
                 }
 
-                count += self.wakeupEntry(idx, .timeout);
+                count += platform.wakeupEntry(idx, .timeout);
             }
 
             // Process pending cancellations, if any
-            var to_cancel = self.cancelq.unlink();
+            var to_cancel = platform.cancelq.unlink();
             while (to_cancel.get()) |op| {
                 if (op.descriptor()) |fd| {
-                    self.emitEvent(Loop.IoCancelEvent, .{ .op = op });
+                    platform.emitEvent(IoCancelEvent, .{ .op = op });
 
                     // remove any file-descriptor tracking entries
-                    _ = self.fdt.cancelEntry(op.idx, fd) orelse
+                    _ = platform.fdt.cancelEntry(op.idx, fd) orelse
                         @panic("No fdt entry to cancel");
                 }
 
                 // Remove the timeout. If not found, then the entry has already
                 // been woken up and removed, so there's nothing more to do here.
-                if (self.timers.unregTimeout(op.idx)) |removed| {
+                if (platform.timers.unregTimeout(op.idx)) |removed| {
                     _ = removed;
 
                     // wakeup the handler and free the entry
-                    count += self.wakeupEntry(op.idx, .canceled);
+                    count += platform.wakeupEntry(op.idx, .canceled);
                 }
 
                 _ = to_cancel.next();
@@ -213,19 +213,19 @@ pub fn LoopFactory(comptime Scheduler: type) type {
 
             // if we haven't processed any ops to this point, poll
             if (count == 0) {
-                var nevents = try self.poller.poll(self.events, timeout_ns);
+                var nevents = try platform.poller.poll(platform.events, timeout_ns);
 
-                for (self.events[0..nevents]) |*ev| {
+                for (platform.events[0..nevents]) |*ev| {
                     const fd = ev.descriptor();
                     const kind = ev.readiness();
 
-                    var ops = self.fdt.getEntries(fd, kind);
+                    var ops = platform.fdt.getEntries(fd, kind);
 
                     while (ops.pop()) |idx| {
                         // remove the timeout that was set for this entry and
                         // wake callback
-                        _ = self.timers.unregTimeout(idx);
-                        count += self.wakeupEntry(idx, .success);
+                        _ = platform.timers.unregTimeout(idx);
+                        count += platform.wakeupEntry(idx, .success);
                     }
                 }
             }
@@ -233,11 +233,11 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             return count;
         }
 
-        fn wakeupEntry(self: *Loop, idx: Index, status: IoStatus) usize {
-            const entry = &self.entries[idx];
+        fn wakeupEntry(platform: *Platform, idx: Index, status: IoStatus) usize {
+            const entry = &platform.entries[idx];
 
             const op = entry.getOp(IoOperation);
-            self.emitEvent(IoWakeEvent, .{ .op = op, .status = status });
+            platform.emitEvent(IoWakeEvent, .{ .op = op, .status = status });
 
             op.completion.status = status;
             op.completion.callback(
@@ -246,30 +246,30 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             );
 
             entry.op = undefined;
-            self.free.push(idx);
+            platform.free.push(idx);
 
-            self.pending -= 1;
+            platform.pending -= 1;
 
             return 1;
         }
 
-        pub fn hasPending(self: *Loop) bool {
-            return self.pending != 0;
+        pub fn hasPending(platform: *Platform) bool {
+            return platform.pending != 0;
         }
 
         fn emitEvent(
-            self: *Loop,
+            platform: *Platform,
             comptime Event: type,
             user: Event.User,
         ) void {
-            self.emitter.emit(self.clock.now(), threadId(), Event, user);
+            platform.emitter.emit(platform.clock.now(), threadId(), Event, user);
         }
 
         const posix = @import("posix_sockets.zig");
 
         // override socket() with nonblocking flag
         pub fn socket(
-            _: *Loop,
+            _: *Platform,
             domain: u32,
             socket_type: u32,
             protocol: u32,
@@ -291,7 +291,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         pub const getsockopt = posix.getsockopt;
 
         pub fn accept(
-            self: *Loop,
+            platform: *Platform,
             listen_fd: Descriptor,
             addr: *std.os.sockaddr,
             addrlen: *std.os.socklen_t,
@@ -300,7 +300,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         ) !Descriptor {
             while (true) {
                 var op = IoOperation{
-                    .loop = self,
+                    .platform = platform,
                     .args = .{ .accept = .{ .listen_fd = listen_fd } },
                 };
 
@@ -315,7 +315,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     return @intCast(Descriptor, fd);
                 } else |err| switch (err) {
                     error.WouldBlock => {
-                        try self.wait(&op, timeout);
+                        try platform.wait(&op, timeout);
                     },
                     else => return err,
                 }
@@ -323,20 +323,20 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         }
 
         pub fn connect(
-            self: *Loop,
+            platform: *Platform,
             fd: Descriptor,
             addr: *std.os.sockaddr,
             addrlen: std.os.socklen_t,
             timeout: Timespec,
         ) !Descriptor {
             var op = IoOperation{
-                .loop = self,
+                .platform = platform,
                 .args = .{ .connect = .{ .fd = fd } },
             };
 
             _ = std.os.connect(fd, addr, addrlen) catch |err| switch (err) {
                 error.WouldBlock => {
-                    try self.wait(&op, timeout);
+                    try platform.wait(&op, timeout);
                 },
                 else => return err,
             };
@@ -348,7 +348,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         }
 
         pub fn recv(
-            self: *Loop,
+            platform: *Platform,
             fd: Descriptor,
             buffer: []u8,
             flags: u32,
@@ -356,7 +356,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         ) !usize {
             while (true) {
                 var op = IoOperation{
-                    .loop = self,
+                    .platform = platform,
                     .args = .{ .recv = .{ .fd = fd } },
                 };
 
@@ -366,7 +366,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     return count;
                 } else |err| switch (err) {
                     error.WouldBlock => {
-                        try self.wait(&op, timeout);
+                        try platform.wait(&op, timeout);
                     },
                     else => return err,
                 }
@@ -374,7 +374,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         }
 
         pub fn send(
-            self: *Loop,
+            platform: *Platform,
             fd: Descriptor,
             buffer: []const u8,
             flags: u32,
@@ -382,7 +382,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         ) !usize {
             while (true) {
                 var op = IoOperation{
-                    .loop = self,
+                    .platform = platform,
                     .args = .{ .send = .{ .fd = fd } },
                 };
 
@@ -392,7 +392,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     return count;
                 } else |err| switch (err) {
                     error.WouldBlock => {
-                        try self.wait(&op, timeout);
+                        try platform.wait(&op, timeout);
                     },
                     else => return err,
                 }
@@ -400,11 +400,11 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         }
 
         fn wait(
-            self: *Loop,
+            platform: *Platform,
             op: *IoOperation,
             timeout: Timespec,
         ) !void {
-            try self.sched.suspendTask(timeout, op);
+            try platform.sched.suspendTask(timeout, op);
 
             return switch (op.completion.status) {
                 .invalid => unreachable,
@@ -413,12 +413,12 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             };
         }
 
-        pub fn sleep(self: *Loop, interval: Timespec) !void {
+        pub fn sleep(platform: *Platform, interval: Timespec) !void {
             var op = IoOperation{
-                .loop = self,
+                .platform = platform,
                 .args = .sleep,
             };
-            try self.sched.suspendTask(interval, &op);
+            try platform.sched.suspendTask(interval, &op);
         }
 
         /// Implements the I/O loop operations for a Futex. See the platform-
@@ -426,10 +426,10 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         pub const FutexEvent = struct {
             op: IoOperation,
 
-            pub fn init(loop: *Loop) FutexEvent {
+            pub fn init(platform: *Platform) FutexEvent {
                 return FutexEvent{
                     .op = IoOperation{
-                        .loop = loop,
+                        .platform = platform,
                         .args = .{ .futex_wait = .{
                             .state = .{ .value = .empty },
                         } },
@@ -440,7 +440,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             /// Waits for a wakeup event (no error) or the timeout to expire.
             pub fn wait(tl: *FutexEvent, maybe_timeout: ?Timespec) !void {
                 const timeout = maybe_timeout orelse max_time;
-                try tl.op.loop.sched.suspendTask(timeout, &tl.op);
+                try tl.op.platform.sched.suspendTask(timeout, &tl.op);
 
                 return switch (tl.op.completion.status) {
                     .success => unreachable,
@@ -525,23 +525,23 @@ const EpollPoller = struct {
         };
     }
 
-    pub fn deinit(self: *Poller) void {
-        assert(self.pollq > 0);
-        std.os.close(self.pollq);
-        self.pollq = -1;
+    pub fn deinit(poller: *Poller) void {
+        assert(poller.pollq > 0);
+        std.os.close(poller.pollq);
+        poller.pollq = -1;
     }
 
     pub const PollError = error{};
 
     pub fn poll(
-        self: *Poller,
+        poller: *Poller,
         events: []Event,
         timeout_ns: usize,
     ) PollError!usize {
         const timeout_ms = @intCast(i32, timeout_ns / std.time.ns_per_ms);
 
         return std.os.epoll_wait(
-            self.pollq,
+            poller.pollq,
             Event.toOsSlice(events),
             timeout_ms,
         );
@@ -551,18 +551,18 @@ const EpollPoller = struct {
 
     pub const RegisterError = std.os.EpollCtlError;
 
-    pub fn register(self: *Poller, fd: Descriptor) RegisterError!void {
-        return self.ctl(.add, fd);
+    pub fn register(poller: *Poller, fd: Descriptor) RegisterError!void {
+        return poller.ctl(.add, fd);
     }
 
     pub const UnregisterError = std.os.EpollCtlError;
 
-    pub fn unregister(self: *Poller, fd: Descriptor) UnregisterError!void {
-        return self.ctl(.del, fd);
+    pub fn unregister(poller: *Poller, fd: Descriptor) UnregisterError!void {
+        return poller.ctl(.del, fd);
     }
 
     fn ctl(
-        self: *Poller,
+        poller: *Poller,
         comptime ctlop: CtlOp,
         fd: Descriptor,
     ) !void {
@@ -578,15 +578,15 @@ const EpollPoller = struct {
             .data = .{ .fd = fd },
         };
 
-        return std.os.epoll_ctl(self.pollq, op, fd, &event);
+        return std.os.epoll_ctl(poller.pollq, op, fd, &event);
     }
 
     const Event = struct {
         event: OsEvent,
 
-        pub fn readiness(self: Event) Readiness {
-            const rd = (self.event.events & std.os.system.EPOLL.IN) != 0;
-            const wr = (self.event.events & std.os.system.EPOLL.OUT) != 0;
+        pub fn readiness(ev: Event) Readiness {
+            const rd = (ev.event.events & std.os.system.EPOLL.IN) != 0;
+            const wr = (ev.event.events & std.os.system.EPOLL.OUT) != 0;
 
             if (rd and wr) return .rdwr;
             if (rd) return .rd;
@@ -594,8 +594,8 @@ const EpollPoller = struct {
             return .none;
         }
 
-        pub fn descriptor(self: Event) Descriptor {
-            return @intCast(Descriptor, self.event.data.fd);
+        pub fn descriptor(ev: Event) Descriptor {
+            return @intCast(Descriptor, ev.event.data.fd);
         }
 
         fn toOsSlice(events: []Event) []OsEvent {
@@ -629,16 +629,16 @@ const KqueuePoller = struct {
         };
     }
 
-    pub fn deinit(self: *Poller) void {
-        assert(self.pollq > 0);
-        std.os.close(self.pollq);
-        self.pollq = -1;
+    pub fn deinit(poller: *Poller) void {
+        assert(poller.pollq > 0);
+        std.os.close(poller.pollq);
+        poller.pollq = -1;
     }
 
     pub const PollError = std.os.KEventError;
 
     pub fn poll(
-        self: *Poller,
+        poller: *Poller,
         events: []Event,
         timeout_ns: usize,
     ) PollError!usize {
@@ -651,7 +651,7 @@ const KqueuePoller = struct {
         };
 
         return std.os.kevent(
-            self.pollq,
+            poller.pollq,
             &[0]OsEvent{},
             Event.toOsSlice(events),
             &ts,
@@ -662,18 +662,18 @@ const KqueuePoller = struct {
 
     pub const RegisterError = std.os.KEventError;
 
-    pub fn register(self: *Poller, fd: Descriptor) !void {
-        return self.ctl(.add, fd);
+    pub fn register(poller: *Poller, fd: Descriptor) !void {
+        return poller.ctl(.add, fd);
     }
 
     pub const UnregisterError = std.os.KEventError;
 
-    pub fn unregister(self: *Poller, fd: Descriptor) !void {
-        return self.ctl(.del, fd);
+    pub fn unregister(poller: *Poller, fd: Descriptor) !void {
+        return poller.ctl(.del, fd);
     }
 
     fn ctl(
-        self: *Poller,
+        poller: *Poller,
         comptime ctlop: CtlOp,
         fd: Descriptor,
     ) !void {
@@ -688,7 +688,7 @@ const KqueuePoller = struct {
         };
 
         _ = try std.os.kevent(
-            self.pollq,
+            poller.pollq,
             Event.toOsSlice(&changes),
             &[0]OsEvent{},
             null,
@@ -714,19 +714,19 @@ const KqueuePoller = struct {
             } };
         }
 
-        pub fn readiness(self: Event) Readiness {
+        pub fn readiness(ev: Event) Readiness {
             const Filter = std.meta.fieldInfo(OsEvent, .filter).field_type;
-            if (self.event.filter == @as(Filter, EVFILT_READ)) {
+            if (ev.event.filter == @as(Filter, EVFILT_READ)) {
                 return .rd;
-            } else if (self.event.filter == @as(Filter, EVFILT_WRITE)) {
+            } else if (ev.event.filter == @as(Filter, EVFILT_WRITE)) {
                 return .wr;
             } else {
                 @panic("unknown event filter");
             }
         }
 
-        pub fn descriptor(self: Event) Descriptor {
-            return @intCast(Descriptor, self.event.ident);
+        pub fn descriptor(ev: Event) Descriptor {
+            return @intCast(Descriptor, ev.event.ident);
         }
 
         fn toOsSlice(events: []Event) []OsEvent {
@@ -743,24 +743,24 @@ const KqueuePoller = struct {
     };
 };
 
-fn IoOperationImpl(comptime Loop: type) type {
+fn IoOperationImpl(comptime Platform: type) type {
     return struct {
-        const Self = @This();
+        const IoOperation = @This();
 
         const IoCompletion = struct {
-            status: Loop.IoStatus,
+            status: Platform.IoStatus,
             callback: fn (*anyopaque, usize) void,
             callback_ctx: *anyopaque,
             callback_data: usize,
         };
 
-        const Descriptor = Loop.Descriptor;
+        const Descriptor = Platform.Descriptor;
 
-        loop: *Loop,
+        platform: *Platform,
 
         idx: Index = undefined,
         completion: IoCompletion = undefined,
-        cancel_next: ?*Self = null, // cancel queue linkage
+        cancel_next: ?*IoOperation = null, // cancel queue linkage
         args: union(enum) {
             sleep,
             futex_wait: struct {
@@ -781,7 +781,7 @@ fn IoOperationImpl(comptime Loop: type) type {
             },
         },
 
-        fn descriptor(op: *const Self) ?Descriptor {
+        fn descriptor(op: *const IoOperation) ?Descriptor {
             return switch (op.args) {
                 .sleep, .futex_wait => null,
                 .accept => |args| args.listen_fd,
@@ -792,21 +792,21 @@ fn IoOperationImpl(comptime Loop: type) type {
         }
 
         pub fn prep(
-            op: *Self,
+            op: *IoOperation,
             timeout: Timespec,
             comptime callback: anytype,
             callback_ctx: anytype,
             callback_data: usize,
         ) !void {
-            const idx = op.loop.free.pop() orelse unreachable; // TODO: error return?
+            const idx = op.platform.free.pop() orelse unreachable; // TODO: error return?
             op.idx = idx;
 
-            var entry = &op.loop.entries[idx];
+            var entry = &op.platform.entries[idx];
             entry.op = op;
 
             // convert timeout to absolute time
             const abs_timeout = if (timeout != max_time)
-                op.loop.clock.now() + timeout
+                op.platform.clock.now() + timeout
             else
                 timeout;
 
@@ -819,8 +819,8 @@ fn IoOperationImpl(comptime Loop: type) type {
                 .callback_data = callback_data,
             };
 
-            op.loop.pending += 1;
-            op.loop.timers.regTimeout(idx);
+            op.platform.pending += 1;
+            op.platform.timers.regTimeout(idx);
 
             const rdy = switch (op.args) {
                 .sleep, .futex_wait => Readiness.none,
@@ -867,26 +867,26 @@ fn IoOperationImpl(comptime Loop: type) type {
 
                 .accept, .connect, .send, .recv => {
                     const fd = op.descriptor() orelse unreachable;
-                    if (op.loop.fdt.submitEntry(idx, fd, rdy)) {
+                    if (op.platform.fdt.submitEntry(idx, fd, rdy)) {
                         // lazily add new fd's to poller
-                        try op.loop.poller.register(fd);
+                        try op.platform.poller.register(fd);
                     }
                 },
             }
 
-            op.loop.emitEvent(Loop.IoSuspendEvent, .{ .op = op });
+            op.platform.emitEvent(Platform.IoSuspendEvent, .{ .op = op });
         }
 
-        fn cancel(op: *Self) void {
-            op.loop.cancelq.insert(op);
+        fn cancel(op: *IoOperation) void {
+            op.platform.cancelq.insert(op);
         }
 
-        pub fn cancelToken(op: *Self) CancelToken {
+        pub fn cancelToken(op: *IoOperation) CancelToken {
             return CancelToken.init(op, cancel);
         }
 
         pub fn format(
-            op: *const Self,
+            op: *const IoOperation,
             comptime fmt: []const u8,
             options: std.fmt.FormatOptions,
             writer: anytype,
@@ -894,7 +894,7 @@ fn IoOperationImpl(comptime Loop: type) type {
             _ = fmt;
             _ = options;
 
-            const entry = &op.loop.entries[op.idx];
+            const entry = &op.platform.entries[op.idx];
 
             try writer.print("{s}", .{@tagName(op.args)});
             try writer.print(" idx={d}", .{op.idx});
@@ -917,7 +917,7 @@ fn TimeWheelImpl(
     comptime link_field: std.meta.FieldEnum(OpEntry),
 ) type {
     return struct {
-        const Self = @This();
+        const TimeWheel = @This();
 
         const Descriptor = OsDescriptor;
         const TimerList = FwdIndexedList(OpEntry, link_field);
@@ -931,44 +931,44 @@ fn TimeWheelImpl(
             entries: []OpEntry,
             num_slots: usize,
             slot_resolution: usize,
-        ) !Self {
+        ) !TimeWheel {
             assert(std.math.isPowerOfTwo(num_slots));
             assert(std.math.isPowerOfTwo(slot_resolution));
 
-            var self = Self{
+            var tw = TimeWheel{
                 .entries = entries,
                 .slots = try alloc.alloc(TimerList, num_slots),
                 .slot_shift = @intCast(u6, std.math.log2(slot_resolution)),
             };
 
-            for (self.slots) |*slot| slot.* = TimerList.init(entries);
+            for (tw.slots) |*slot| slot.* = TimerList.init(entries);
 
-            return self;
+            return tw;
         }
 
-        pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
-            alloc.free(self.slots);
+        pub fn deinit(tw: *TimeWheel, alloc: std.mem.Allocator) void {
+            alloc.free(tw.slots);
         }
 
         /// Insert a new timeout linkage based on the entry in idx.
         /// NOTE: assumes the entry already has its timeout field set
-        pub fn regTimeout(self: *Self, idx: Index) void {
-            const to = self.entries[idx].timeout;
+        pub fn regTimeout(tw: *TimeWheel, idx: Index) void {
+            const to = tw.entries[idx].timeout;
 
             // append entry into timewheel slot
-            self.slots[self.getSlotIndex(to)].push(idx);
+            tw.slots[tw.getSlotIndex(to)].push(idx);
         }
 
         /// Delete the timeout linkage for entry at `idx'. Returns the timeout
         /// value that was removed, or null if it wasn't found.
-        pub fn unregTimeout(self: *Self, idx: Index) ?Timespec {
-            const to = self.entries[idx].timeout;
+        pub fn unregTimeout(tw: *TimeWheel, idx: Index) ?Timespec {
+            const to = tw.entries[idx].timeout;
 
             // Because we use a singly-linked (forward) list for each slot,
             // we have to iterate from the slot head until we find the matching
             // entry to remove. This should perform OK provided we have fairly
             // short TimeLists, i.e. enough slots and even distribution across.
-            const slot = &self.slots[self.getSlotIndex(to)];
+            const slot = &tw.slots[tw.getSlotIndex(to)];
 
             if (slot.unlink(idx)) return to;
 
@@ -977,23 +977,23 @@ fn TimeWheelImpl(
 
         /// Find timeouts in the range (range.0, range.1], and move them
         /// from the timer wheel onto the returned list.
-        pub fn expireTimeouts(self: *Self, range: [2]Timespec) TimerList {
-            const start = self.getSlotIndex(range[0]);
+        pub fn expireTimeouts(tw: *TimeWheel, range: [2]Timespec) TimerList {
+            const start = tw.getSlotIndex(range[0]);
             const count = std.math.min(
-                self.getSlotDelta(range),
-                self.slots.len,
+                tw.getSlotDelta(range),
+                tw.slots.len,
             );
             assert(count >= 1);
 
-            var list = TimerList.init(self.entries);
+            var list = TimerList.init(tw.entries);
             var i: usize = 0;
             while (i < count) : (i += 1) {
-                const idx = (start + i) % self.slots.len;
-                const slot = &self.slots[idx];
+                const idx = (start + i) % tw.slots.len;
+                const slot = &tw.slots[idx];
 
                 var it = slot.iter();
                 while (it.get()) |elem_idx| {
-                    const e = &self.entries[elem_idx];
+                    const e = &tw.entries[elem_idx];
                     if (e.timeout > range[0] and e.timeout <= range[1]) {
                         // unlink from the slot, advance the iterator
                         _ = slot.delete(&it) orelse unreachable;
@@ -1014,15 +1014,15 @@ fn TimeWheelImpl(
         /// and are thus forced to scan all timers. Only call this in
         /// specialized scenarios such as when simulating time with an
         /// autojump clock.
-        pub fn nextTimeout(self: *const Self, after: Timespec) ?Timespec {
+        pub fn nextTimeout(tw: *const TimeWheel, after: Timespec) ?Timespec {
             var min_timeout: ?Timespec = null;
             var idx: usize = 0;
-            while (idx < self.slots.len) : (idx += 1) {
-                const slot = &self.slots[idx];
+            while (idx < tw.slots.len) : (idx += 1) {
+                const slot = &tw.slots[idx];
 
                 var it = slot.iter();
                 while (it.get()) |elem_idx| : (_ = it.next()) {
-                    const entry_timeout = self.entries[elem_idx].timeout;
+                    const entry_timeout = tw.entries[elem_idx].timeout;
                     if (entry_timeout <= after) continue;
 
                     if (min_timeout == null or entry_timeout < min_timeout.?) {
@@ -1034,18 +1034,18 @@ fn TimeWheelImpl(
             return min_timeout;
         }
 
-        fn getSlotIndex(self: *Self, val: Timespec) usize {
+        fn getSlotIndex(tw: *TimeWheel, val: Timespec) usize {
             // We divide timespec into three contiguous bit ranges:
             //  - lower (least-significant): truncated by slot_resolution
             //  - middle: maps to the slot in the timewheel
             //  - upper: remaining bits of timespec for matching
-            return (val >> self.slot_shift) % self.slots.len;
+            return (val >> tw.slot_shift) % tw.slots.len;
         }
 
-        fn getSlotDelta(self: *Self, range: [2]Timespec) usize {
+        fn getSlotDelta(tw: *TimeWheel, range: [2]Timespec) usize {
             assert(range[1] >= range[0]);
-            const upper = (range[1] >> self.slot_shift);
-            const lower = (range[0] >> self.slot_shift);
+            const upper = (range[1] >> tw.slot_shift);
+            const lower = (range[0] >> tw.slot_shift);
             return upper - lower + 1;
         }
     };
@@ -1088,7 +1088,7 @@ fn FileDescriptorTableImpl(
     comptime link_field: std.meta.FieldEnum(Entry),
 ) type {
     return struct {
-        const Self = @This();
+        const FileDescriptorTable = @This();
 
         const Descriptor = OsDescriptor;
         const List = FwdIndexedList(Entry, link_field);
@@ -1107,37 +1107,40 @@ fn FileDescriptorTableImpl(
             alloc: std.mem.Allocator,
             entries: []Entry,
             max_fd: usize,
-        ) !Self {
+        ) !FileDescriptorTable {
             assert(std.math.isPowerOfTwo(max_fd));
 
-            var self = Self{
+            var fdt = FileDescriptorTable{
                 .entries = entries,
                 .fdt = try alloc.alloc(DescriptorEntry, max_fd),
                 .pending = 0,
             };
 
-            for (self.fdt) |*fde| fde.* = DescriptorEntry{
+            for (fdt.fdt) |*fde| fde.* = DescriptorEntry{
                 .tracked = false,
                 .rdlist = List.init(entries),
                 .wrlist = List.init(entries),
             };
 
-            return self;
+            return fdt;
         }
 
-        pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
-            alloc.free(self.fdt);
+        pub fn deinit(
+            fdt: *FileDescriptorTable,
+            alloc: std.mem.Allocator,
+        ) void {
+            alloc.free(fdt.fdt);
         }
 
         /// Submits a new operation entry from slot idx in the borrowed entries
         /// slice.
         pub fn submitEntry(
-            self: *Self,
+            fdt: *FileDescriptorTable,
             idx: Index,
             fd: Descriptor,
             kind: Readiness,
         ) bool {
-            var fde = &self.fdt[@intCast(usize, fd)];
+            var fde = &fdt.fdt[@intCast(usize, fd)];
 
             switch (kind) {
                 .rd => fde.rdlist.push(idx),
@@ -1146,7 +1149,7 @@ fn FileDescriptorTableImpl(
                 .rdwr => @panic("op cannot require read and write readiness"),
             }
 
-            self.pending += 1;
+            fdt.pending += 1;
 
             if (!fde.tracked) {
                 fde.tracked = true;
@@ -1162,11 +1165,11 @@ fn FileDescriptorTableImpl(
         /// when processing timeouts, and from a worker thread when cancelling
         /// a task.
         pub fn cancelEntry(
-            self: *Self,
+            fdt: *FileDescriptorTable,
             idx: Index,
             fd: Descriptor,
         ) ?Index {
-            var fde = &self.fdt[@intCast(usize, fd)];
+            var fde = &fdt.fdt[@intCast(usize, fd)];
             const lists = [_]*List{ &fde.rdlist, &fde.wrlist };
 
             for (lists) |list| {
@@ -1179,14 +1182,14 @@ fn FileDescriptorTableImpl(
         /// Removes and returns any pending entries that were waiting for
         /// `kind' readiness.
         pub fn getEntries(
-            self: *Self,
+            fdt: *FileDescriptorTable,
             fd: Descriptor,
             kind: Readiness,
         ) List {
-            var fde = &self.fdt[@intCast(usize, fd)];
+            var fde = &fdt.fdt[@intCast(usize, fd)];
 
             // Find and remove all entries matching our readiness kind
-            var empty = List.init(self.entries);
+            var empty = List.init(fdt.entries);
             const lists = switch (kind) {
                 .rd => [_]*List{ &fde.rdlist, &empty },
                 .wr => [_]*List{ &fde.wrlist, &empty },
@@ -1194,14 +1197,14 @@ fn FileDescriptorTableImpl(
                 .none => @panic("getEntries() called with 'none' readiness"),
             };
 
-            var ret = List.init(self.entries);
+            var ret = List.init(fdt.entries);
             for (lists) |list| {
                 var it = list.iter();
                 while (it.get()) |idx| {
                     // NOTE: delete advances iterator
                     _ = list.delete(&it) orelse unreachable;
                     ret.push(idx);
-                    self.pending -= 1;
+                    fdt.pending -= 1;
                 }
             }
 
@@ -1260,14 +1263,14 @@ pub const Readiness = enum(u2) {
     wr = 2,
     rdwr = 3,
 
-    pub fn isReadable(self: Readiness) bool {
+    pub fn isReadable(rdy: Readiness) bool {
         const rd = @enumToInt(Readiness.rd);
-        return ((@enumToInt(self) & rd) == rd);
+        return ((@enumToInt(rdy) & rd) == rd);
     }
 
-    pub fn isWritable(self: Readiness) bool {
+    pub fn isWritable(rdy: Readiness) bool {
         const wr = @enumToInt(Readiness.wr);
-        return ((@enumToInt(self) & wr) == wr);
+        return ((@enumToInt(rdy) & wr) == wr);
     }
 };
 

@@ -18,34 +18,34 @@ const GetSockNameError = anyerror; // TODO: narrow
 const PrepError = anyerror; // TODO: narrow
 const CompleteError = anyerror; // TODO: narrow
 
-pub const SimIoLoop = struct {
+pub const SimPlatform = struct {
     sched: *Scheduler,
     pending: usize,
 
-    pub fn init(sched: *Scheduler, _: std.mem.Allocator) InitError!SimIoLoop {
-        return SimIoLoop{
+    pub fn init(sched: *Scheduler, _: std.mem.Allocator) InitError!SimPlatform {
+        return SimPlatform{
             .sched = sched,
             .pending = 0,
         };
     }
 
-    pub fn deinit(_: *SimIoLoop, _: std.mem.Allocator) void {}
+    pub fn deinit(_: *SimPlatform, _: std.mem.Allocator) void {}
 
     /// Polls for event completions, triggering the registered wakeup callback
     /// (typically to reschedule a task for continued execution).  Waits up to
     /// `timeout' nanoseconds for a completion. Returns the number of
     /// completions handled.
-    pub fn poll(_: *SimIoLoop, timeout_ns: Timespec) usize {
+    pub fn poll(_: *SimPlatform, timeout_ns: Timespec) usize {
         _ = timeout_ns;
-        unreachable; // TODO: SimIoLoop poll()
+        unreachable; // TODO: SimPlatform poll()
     }
 
-    pub fn hasPending(self: *SimIoLoop) bool {
-        return self.pending != 0;
+    pub fn hasPending(platform: *SimPlatform) bool {
+        return platform.pending != 0;
     }
 
     pub fn socket(
-        _: *SimIoLoop,
+        _: *SimPlatform,
         domain: u32,
         socket_type: u32,
         protocol: u32,
@@ -57,7 +57,7 @@ pub const SimIoLoop = struct {
     }
 
     pub fn close(
-        _: *SimIoLoop,
+        _: *SimPlatform,
         sock: Descriptor,
     ) void {
         _ = sock;
@@ -65,7 +65,7 @@ pub const SimIoLoop = struct {
     }
 
     pub fn bind(
-        _: *SimIoLoop,
+        _: *SimPlatform,
         sock: Descriptor,
         addr: *const std.os.sockaddr,
         len: std.os.socklen_t,
@@ -77,7 +77,7 @@ pub const SimIoLoop = struct {
     }
 
     pub fn listen(
-        _: *SimIoLoop,
+        _: *SimPlatform,
         sock: Descriptor,
         backlog: u31,
     ) ListenError!void {
@@ -87,7 +87,7 @@ pub const SimIoLoop = struct {
     }
 
     pub fn setsockopt(
-        _: *SimIoLoop,
+        _: *SimPlatform,
         fd: Descriptor,
         level: u32,
         optname: u32,
@@ -101,7 +101,7 @@ pub const SimIoLoop = struct {
     }
 
     pub fn getsockname(
-        _: *SimIoLoop,
+        _: *SimPlatform,
         sock: Descriptor,
         addr: *std.os.sockaddr,
         addrlen: *std.os.socklen_t,
@@ -112,17 +112,17 @@ pub const SimIoLoop = struct {
         unreachable; // TODO: getsockname() sim
     }
 
-    pub fn sleep(self: *SimIoLoop, interval: Timespec) !void {
+    pub fn sleep(platform: *SimPlatform, interval: Timespec) !void {
         var op = IoOperation{
-            .loop = self,
+            .platform = platform,
             .args = .sleep,
         };
-        try self.sched.suspendTask(interval, &op);
+        try platform.sched.suspendTask(interval, &op);
         _ = try op.complete();
     }
 
     pub fn accept(
-        self: *SimIoLoop,
+        platform: *SimPlatform,
         listen_fd: Descriptor,
         addr: *std.os.sockaddr,
         addrlen: *std.os.socklen_t,
@@ -130,7 +130,7 @@ pub const SimIoLoop = struct {
         _: Timespec,
     ) !Descriptor {
         return IoOperation{
-            .loop = self,
+            .platform = platform,
             .args = .{ .accept = .{
                 .listen_fd = listen_fd,
                 .addr = addr,
@@ -141,7 +141,7 @@ pub const SimIoLoop = struct {
     }
 
     const IoOperation = struct {
-        loop: *SimIoLoop,
+        platform: *SimPlatform,
 
         args: union(enum) {
             sleep,
