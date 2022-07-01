@@ -1,12 +1,15 @@
 //! A CancelQueue is a singly linked list that supports two operations:
 //! `insert` a new item and `unlink` the entire list. Both are thread-safe,
 //! with `unlink` enabling a caller to traverse the list without holding a
-//! lock.
+//! lock. Nodes in the list are intrusive and ownership over the node is
+//! retained by the caller. Thus, the lifetime of a node must outlive its
+//! life on the list.
 //!
 //! This data structure is designed to model the cancellation of I/O operations
 //! in multiple platform backends, where cancellation may be requested from
 //! any thread, but must be processed by a specific thread where the I/O
-//! originated.
+//! originated. The lifetime of a "Node" (IoOperation) must outlive the
+//! cancellation duration.
 
 const std = @import("std");
 
@@ -69,4 +72,62 @@ pub fn CancelQueue(comptime Node: type, comptime link_name: []const u8) type {
             }
         };
     };
+}
+
+test "CancelQueue" {
+    const alloc = std.testing.allocator;
+
+    const TestNode = struct {
+        canceled: bool = false,
+        next: ?*@This() = null,
+    };
+
+    const Queue = CancelQueue(TestNode, "next");
+
+    const Worker = struct {
+        fn entry(queue: *Queue, num_iter: usize) void {
+            // items to enqueue must outlive cancellation
+            var items = alloc.alloc(TestNode, num_iter) catch unreachable;
+            defer alloc.free(items);
+
+            for (items) |*it| {
+                it.* = TestNode{};
+                queue.insert(it);
+            }
+
+            // spin while waiting for cancelation to finish
+            for (items) |*it| {
+                while (@atomicLoad(bool, &it.canceled, .Monotonic) == false) {}
+            }
+        }
+    };
+
+    const num_threads = 4;
+    const num_iter = 1000;
+
+    var workers = try alloc.alloc(std.Thread, num_threads);
+    defer alloc.free(workers);
+
+    var queue = Queue{};
+
+    for (workers) |*w| {
+        w.* = try std.Thread.spawn(
+            .{},
+            Worker.entry,
+            .{ &queue, num_iter },
+        );
+    }
+
+    var count: usize = 0;
+    while (count < num_iter * num_threads) {
+        var to_cancel = queue.unlink();
+        while (to_cancel.get()) |item| : (_ = to_cancel.next()) {
+            @atomicStore(bool, &item.canceled, true, .Monotonic);
+            count += 1;
+        }
+    }
+
+    for (workers) |*w| {
+        w.join();
+    }
 }

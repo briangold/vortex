@@ -190,7 +190,7 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
 
             // Process pending cancellations, if any
             var to_cancel = platform.cancelq.unlink();
-            while (to_cancel.get()) |op| {
+            while (to_cancel.get()) |op| : (_ = to_cancel.next()) {
                 if (op.descriptor()) |fd| {
                     platform.emitEvent(IoCancelEvent, .{ .op = op });
 
@@ -207,8 +207,6 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
                     // wakeup the handler and free the entry
                     count += platform.wakeupEntry(op.idx, .canceled);
                 }
-
-                _ = to_cancel.next();
             }
 
             // if we haven't processed any ops to this point, poll

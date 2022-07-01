@@ -153,7 +153,7 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
             }
 
             var to_cancel = platform.cancelq.unlink();
-            while (to_cancel.get()) |op| {
+            while (to_cancel.get()) |op| : (_ = to_cancel.next()) {
                 switch (op.args) {
                     // cancellable operations
                     .sleep,
@@ -185,8 +185,6 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
                         };
                     },
                 }
-
-                _ = to_cancel.next();
             }
 
             return user_events;
