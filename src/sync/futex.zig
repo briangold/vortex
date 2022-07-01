@@ -77,25 +77,34 @@ pub fn Futex(comptime Runtime: type) type {
             }
 
             // start waiting
-            waiter.event.wait(interval) catch {
-                {
+            waiter.event.wait(interval) catch |err| switch (err) {
+                error.TaskTimeout, error.FutexTimeout => {
                     bucket.mutex.lock();
-                    defer bucket.mutex.unlock();
-
                     cancelled = WaitQueue.tryRemove(&bucket.treap, address, &waiter);
-                }
+                    bucket.mutex.unlock();
 
-                if (cancelled) {
-                    return error.Timeout;
-                } else {
-                    // If we fail to cancel after a timeout, it means a waker task
-                    // dequeued us and will wake us up.  We must wait until the
-                    // event is canceled as that's a signal that the waker wont
-                    // access the waiter memory anymore. If we return early without
-                    // waiting, the waiter on the stack would be invalidated and the
-                    // waker task risks a UAF.
-                    waiter.event.wait(null) catch unreachable;
-                }
+                    if (cancelled) {
+                        // Successful removal means we hit the timeout and
+                        // removed the waiter from the WaitQueue
+                        return err;
+                    } else {
+                        // If we fail to cancel after a timeout, it means a
+                        // waker task dequeued us and will wake us up.  We must
+                        // wait until the event is canceled as that's a signal
+                        // that the waker won't access the waiter memory
+                        // anymore. If we return early without waiting, the
+                        // waiter on the stack would be invalidated and the
+                        // waker task risks a UAF.
+                        waiter.event.wait(null) catch |err2| switch (err2) {
+                            // Propagate TaskTimeout back, but a FutexTimeout
+                            // cannot occur here.
+                            error.TaskTimeout => return err2,
+                            else => unreachable,
+                        };
+                    }
+                },
+
+                else => std.debug.panic("unexpected error: {}\n", .{err}),
             };
         }
 
@@ -281,7 +290,8 @@ pub fn Futex(comptime Runtime: type) type {
                     removed.push(waiter);
 
                     // When dequeueing, we must mark is_queued as false.
-                    // This ensures that a waiter which calls tryRemove() returns false.
+                    // This ensures that a waiter which calls tryRemove()
+                    // returns false.
                     assert(waiter.is_queued);
                     waiter.is_queued = false;
                 }

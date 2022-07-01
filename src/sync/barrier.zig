@@ -3,9 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-
 const Atomic = std.atomic.Atomic;
-const futex = @import("../../vortex.zig").sync.futex;
 
 const clock = @import("../clock.zig");
 const Timespec = clock.Timespec;

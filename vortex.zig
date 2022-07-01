@@ -60,6 +60,10 @@ fn VortexImpl(comptime R: type) type {
 
         /// Task spawning operations and types
         pub const task = struct {
+            /// The currently running task id
+            pub fn id() Scheduler.TaskId {
+                return _instance.sched.currentTaskId();
+            }
 
             /// A SpawnHandle holds the task-specific stack frame and associated state
             /// necessary to implement the handle's join() and cancel() methods.

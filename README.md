@@ -138,17 +138,6 @@ optimizations](https://zig.news/kprotty/resource-efficient-thread-pools-with-zig
 
 Just some rough notes for now:
 
-- **Synchronization primitives.** We can implement both an actor-style
-message-passing model with *channels* between tasks and a shared-memory style
-synchronization with task-aware spinlocks, barriers, etc. The core of these will
-likely require a task-aware Futex-type system, where a task can wait() on a 
-value and another task can wake() one or more waiters.
-
-- **Select-ing between tasks.** We lack a way to spawn multiple tasks and cancel
-all but the first one to complete. We can likely build a selection *combinator*
-that launches tasks in a group and provides each task with a synchronized
-cancel-peers mechanism to run on completion. 
-
 - **Priorities and resource accounting.** In large systems, we'll likely want to
 track, schedule, and budget different tasks and task groups. Consider a system
 with foreground tasks that handle user requests, and background tasks that

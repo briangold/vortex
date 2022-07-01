@@ -7,6 +7,7 @@ const Emitter = @import("../event.zig").Emitter;
 const EventRegistry = @import("../event.zig").EventRegistry;
 const CancelToken = @import("../scheduler.zig").CancelToken;
 const FwdIndexedList = @import("../list.zig").FwdIndexedList;
+const CancelQueue = @import("cancel_queue.zig").CancelQueue;
 const OsDescriptor = std.os.fd_t;
 const max_time = @import("../clock.zig").max_time;
 const threadId = @import("../runtime.zig").threadId;
@@ -76,6 +77,21 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         const TimeWheel = TimeWheelImpl(Entry, .next_to);
         const FileDescriptorTable = FileDescriptorTableImpl(Entry, .next);
         const IoOperation = IoOperationImpl(Loop);
+        const IoStatus = enum {
+            invalid,
+            success,
+            timeout,
+            canceled,
+
+            pub fn format(
+                self: IoStatus,
+                comptime _: []const u8,
+                _: std.fmt.FormatOptions,
+                writer: anytype,
+            ) !void {
+                try writer.print("{s}", .{@tagName(self)});
+            }
+        };
 
         clock: *Clock,
         sched: *Scheduler,
@@ -88,6 +104,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         prevTime: Timespec,
         poller: Poller,
         events: []Poller.Event,
+        cancelq: CancelQueue(IoOperation, "cancel_next"),
 
         pub const InitError = anyerror; // TODO: more precise
 
@@ -124,6 +141,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                 .prevTime = 0,
                 .poller = try Poller.init(),
                 .events = try alloc.alloc(Poller.Event, config.max_poll_events),
+                .cancelq = .{},
             };
 
             var idx: Index = 0;
@@ -167,8 +185,30 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     ) orelse @panic("No fdt entry to expire");
                 }
 
-                const canceled = (op.args != .sleep);
-                count += self.wakeupEntry(idx, canceled);
+                count += self.wakeupEntry(idx, .timeout);
+            }
+
+            // Process pending cancellations, if any
+            var to_cancel = self.cancelq.unlink();
+            while (to_cancel.get()) |op| {
+                if (op.descriptor()) |fd| {
+                    self.emitEvent(Loop.IoCancelEvent, .{ .op = op });
+
+                    // remove any file-descriptor tracking entries
+                    _ = self.fdt.cancelEntry(op.idx, fd) orelse
+                        @panic("No fdt entry to cancel");
+                }
+
+                // Remove the timeout. If not found, then the entry has already
+                // been woken up and removed, so there's nothing more to do here.
+                if (self.timers.unregTimeout(op.idx)) |removed| {
+                    _ = removed;
+
+                    // wakeup the handler and free the entry
+                    count += self.wakeupEntry(op.idx, .canceled);
+                }
+
+                _ = to_cancel.next();
             }
 
             // if we haven't processed any ops to this point, poll
@@ -185,7 +225,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                         // remove the timeout that was set for this entry and
                         // wake callback
                         _ = self.timers.unregTimeout(idx);
-                        count += self.wakeupEntry(idx, false);
+                        count += self.wakeupEntry(idx, .success);
                     }
                 }
             }
@@ -193,13 +233,13 @@ pub fn LoopFactory(comptime Scheduler: type) type {
             return count;
         }
 
-        fn wakeupEntry(self: *Loop, idx: Index, canceled: bool) usize {
+        fn wakeupEntry(self: *Loop, idx: Index, status: IoStatus) usize {
             const entry = &self.entries[idx];
 
             const op = entry.getOp(IoOperation);
-            self.emitEvent(IoWakeEvent, .{ .op = op, .canceled = canceled });
+            self.emitEvent(IoWakeEvent, .{ .op = op, .status = status });
 
-            op.completion.canceled = canceled;
+            op.completion.status = status;
             op.completion.callback(
                 op.completion.callback_ctx,
                 op.completion.callback_data,
@@ -366,7 +406,11 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         ) !void {
             try self.sched.suspendTask(timeout, op);
 
-            if (op.completion.canceled) return error.IoCanceled;
+            return switch (op.completion.status) {
+                .invalid => unreachable,
+                .canceled, .timeout => error.IoCanceled,
+                .success => {},
+            };
         }
 
         pub fn sleep(self: *Loop, interval: Timespec) !void {
@@ -398,7 +442,12 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                 const timeout = maybe_timeout orelse max_time;
                 try tl.op.loop.sched.suspendTask(timeout, &tl.op);
 
-                if (tl.op.completion.canceled) return error.Timeout;
+                return switch (tl.op.completion.status) {
+                    .success => unreachable,
+                    .timeout => error.FutexTimeout,
+                    .canceled => {}, // we canceled the timeout = success
+                    .invalid => unreachable,
+                };
             }
 
             /// Notifies the wait-half of this event
@@ -410,6 +459,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                 //   waiting => _        :: notify the waiter
                 while (true) {
                     switch (state.load(.Acquire)) {
+                        // The notification arrives before the waiter
                         .empty => {
                             if (state.tryCompareAndSwap(
                                 .empty,
@@ -421,19 +471,22 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                             }
                             // CAS failure - retry
                         },
+
+                        // The waiter arrived first, so remove its timeout
                         .waiting => {
-                            // Note: we don't use op.cancel here as we are not
-                            // canceling the operation, just the timeout.
+                            // Update the state. In the rare case where a waiter
+                            // observes that it has been removed from the
+                            // WaitQueue, this state update ensures the 2nd,
+                            // indefinite wait doesn't block.
+                            state.store(.notified, .Release);
 
-                            // remove the timeout
-                            _ = tl.op.loop.timers.unregTimeout(tl.op.idx) orelse
-                                @panic("No timer entry to cancel");
-
-                            // wakeup the handler and free the entry
-                            _ = tl.op.loop.wakeupEntry(tl.op.idx, false);
+                            // Cancel the timeout and wake the callback
+                            tl.op.cancel();
 
                             return;
                         },
+
+                        // Double-notify cannot happen
                         .notified => unreachable,
                     }
                 }
@@ -450,7 +503,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         });
         const IoWakeEvent = ScopedRegistry.register(.io_wake, .debug, struct {
             op: *IoOperation,
-            canceled: bool,
+            status: IoStatus,
         });
         const IoCancelEvent = ScopedRegistry.register(.io_cancel, .debug, struct {
             op: *IoOperation,
@@ -695,7 +748,7 @@ fn IoOperationImpl(comptime Loop: type) type {
         const Self = @This();
 
         const IoCompletion = struct {
-            canceled: bool,
+            status: Loop.IoStatus,
             callback: fn (*anyopaque, usize) void,
             callback_ctx: *anyopaque,
             callback_data: usize,
@@ -707,6 +760,7 @@ fn IoOperationImpl(comptime Loop: type) type {
 
         idx: Index = undefined,
         completion: IoCompletion = undefined,
+        cancel_next: ?*Self = null, // cancel queue linkage
         args: union(enum) {
             sleep,
             futex_wait: struct {
@@ -759,7 +813,7 @@ fn IoOperationImpl(comptime Loop: type) type {
             entry.timeout = abs_timeout;
 
             op.completion = IoCompletion{
-                .canceled = false,
+                .status = .invalid,
                 .callback = callback,
                 .callback_ctx = callback_ctx,
                 .callback_data = callback_data,
@@ -783,6 +837,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                     //   notified => _        :: already notified, so cancel
                     while (true) {
                         switch (args.state.load(.Acquire)) {
+                            // common case
                             .empty => {
                                 if (args.state.tryCompareAndSwap(
                                     .empty,
@@ -794,17 +849,15 @@ fn IoOperationImpl(comptime Loop: type) type {
                                 }
                                 // CAS failure - retry
                             },
-                            .waiting => unreachable,
+
+                            // rare: race with waker, we re-wait indefinitely
+                            // (see Futex.wait())
+                            .waiting => return,
+
+                            // notification already arrived, remove timeout
                             .notified => {
-                                // Note: we don't use op.cancel here as we are not
-                                // canceling the operation, just the timeout.
-
-                                // remove the timeout
-                                _ = op.loop.timers.unregTimeout(op.idx) orelse
-                                    @panic("No timer entry to cancel");
-
-                                // wakeup the handler and free the entry
-                                _ = op.loop.wakeupEntry(op.idx, false);
+                                // Cancel the timeout and wake the callback
+                                op.cancel();
 
                                 return;
                             },
@@ -825,20 +878,7 @@ fn IoOperationImpl(comptime Loop: type) type {
         }
 
         fn cancel(op: *Self) void {
-            if (op.descriptor()) |fd| {
-                op.loop.emitEvent(Loop.IoCancelEvent, .{ .op = op });
-
-                // remove any file-descriptor tracking entries
-                _ = op.loop.fdt.cancelEntry(op.idx, fd) orelse
-                    @panic("No fdt entry to cancel");
-            }
-
-            // remove the timeout
-            _ = op.loop.timers.unregTimeout(op.idx) orelse
-                @panic("No timer entry to cancel");
-
-            // wakeup the handler and free the entry
-            _ = op.loop.wakeupEntry(op.idx, true);
+            op.loop.cancelq.insert(op);
         }
 
         pub fn cancelToken(op: *Self) CancelToken {

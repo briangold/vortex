@@ -23,7 +23,10 @@ fn test_futex(comptime V: type) !void {
             var x = Atomic(u32).init(0);
 
             // A 1ns timeout on wait should error back
-            try std.testing.expectError(error.Timeout, Futex.wait(&x, 0, 1));
+            try std.testing.expectError(
+                error.FutexTimeout,
+                Futex.wait(&x, 0, 1),
+            );
 
             var ch: SpawnHandle(child) = undefined;
             try spawn(&ch, .{ &x, pre_wait_time }, null);

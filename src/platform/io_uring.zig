@@ -8,6 +8,7 @@ const Timespec = @import("../clock.zig").Timespec;
 const CancelToken = @import("../scheduler.zig").CancelToken;
 const Emitter = @import("../event.zig").Emitter;
 const EventRegistry = @import("../event.zig").EventRegistry;
+const CancelQueue = @import("cancel_queue.zig").CancelQueue;
 const max_time = @import("../clock.zig").max_time;
 const threadId = @import("../runtime.zig").threadId;
 
@@ -41,6 +42,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
         io_uring: IoUring,
         pending: usize,
         events: []CompletionEvent,
+        cancelq: CancelQueue(IoOperation, "cancel_next"),
 
         pub const InitError = anyerror; // TODO: more precise
 
@@ -68,6 +70,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                     CompletionEvent,
                     config.max_poll_events,
                 ),
+                .cancelq = .{},
             };
         }
 
@@ -115,6 +118,13 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                 const cqe = &self.events[i];
 
                 switch (cqe.user_data) {
+                    0 => {
+                        std.debug.panic(
+                            "Unexpected cqe user data 0: {any}\n",
+                            .{cqe},
+                        );
+                    },
+
                     internal_timeout_userdata,
                     internal_cancel_userdata,
                     internal_link_timeout_userdata,
@@ -140,6 +150,43 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                         );
                     },
                 }
+            }
+
+            var to_cancel = self.cancelq.unlink();
+            while (to_cancel.get()) |op| {
+                switch (op.args) {
+                    // cancellable operations
+                    .sleep,
+                    .futex_wait,
+                    => {
+                        // this queues the cancellation as a SQE, which will be
+                        // processed by the poll() loop like any other
+                        _ = self.io_uring.timeout_remove(
+                            internal_cancel_userdata,
+                            @ptrToInt(op),
+                            0,
+                        ) catch |err| {
+                            std.debug.panic("timeout_remove failed: {s}", .{err});
+                        };
+                    },
+                    .accept,
+                    .connect,
+                    .recv,
+                    .send,
+                    => {
+                        // this queues the cancellation as a SQE, which will be
+                        // processed by the poll() loop like any other
+                        _ = self.io_uring.cancel(
+                            internal_cancel_userdata,
+                            @ptrToInt(op),
+                            0,
+                        ) catch |err| {
+                            std.debug.panic("cancellation failed: {s}", .{err});
+                        };
+                    },
+                }
+
+                _ = to_cancel.next();
             }
 
             return user_events;
@@ -296,6 +343,7 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                 //   waiting => _        :: notify the waiter
                 while (true) {
                     switch (state.load(.Acquire)) {
+                        // The notification arrives before the waiter
                         .empty => {
                             if (state.tryCompareAndSwap(
                                 .empty,
@@ -307,11 +355,23 @@ pub fn LoopFactory(comptime Scheduler: type) type {
                             }
                             // CAS failure - retry
                         },
+
+                        // The waiter arrived first, so cancel its timeout. This
+                        // causes the waiter to "wake up" with a ECANCELLED
+                        // return code, delivered to the op complete() method.
                         .waiting => {
+                            // Update the state. In the rare case where a waiter
+                            // observes that it has been removed from the
+                            // WaitQueue, this state update ensures the 2nd,
+                            // indefinite wait doesn't block.
+                            state.store(.notified, .Release);
+
                             // cancel waiting op
                             tl.op.cancel();
                             return;
                         },
+
+                        // Double-notify cannot happen
                         .notified => unreachable,
                     }
                 }
@@ -351,6 +411,7 @@ fn IoOperationImpl(comptime Loop: type) type {
         loop: *Loop,
         completion: IoCompletion = undefined,
         timeout: std.os.linux.kernel_timespec = undefined,
+        cancel_next: ?*Self = null, // cancel queue linkage
 
         // per-opcode arguments
         args: union(enum) {
@@ -427,6 +488,7 @@ fn IoOperationImpl(comptime Loop: type) type {
                     //   notified => _        :: already notified, so cancel
                     while (true) {
                         switch (args.state.load(.Acquire)) {
+                            // common case
                             .empty => {
                                 if (args.state.tryCompareAndSwap(
                                     .empty,
@@ -438,9 +500,13 @@ fn IoOperationImpl(comptime Loop: type) type {
                                 }
                                 // CAS failure - retry
                             },
-                            .waiting => unreachable,
+
+                            // rare: race with waker, we re-wait indefinitely
+                            // (see Futex.wait())
+                            .waiting => return,
+
+                            // notification already arrived, cancel
                             .notified => {
-                                // notification already arrived, cancel
                                 op.cancel();
                                 return;
                             },
@@ -530,8 +596,17 @@ fn IoOperationImpl(comptime Loop: type) type {
                 .futex_wait => {
                     if (op.completion.result < 0) {
                         return switch (@intToEnum(std.os.E, -op.completion.result)) {
+                            // When a waiter is "notified", the waiter's timeout
+                            // operation is cancelled, causing the ECANCELED
+                            // return here. We turn this into a non-error return
+                            // code.
                             .CANCELED => @as(usize, 0),
-                            .TIME => error.Timeout,
+
+                            // If the waiter isn't notified in time, return a
+                            // FutexTimeout, which we keep separate from a
+                            // TaskTimeout that may also occur.
+                            .TIME => error.FutexTimeout,
+
                             else => unreachable,
                         };
                     } else unreachable;
@@ -643,38 +718,7 @@ fn IoOperationImpl(comptime Loop: type) type {
 
         fn cancel(op: *Self) void {
             op.loop.emitEvent(Loop.IoCancelEvent, .{ .op = op });
-
-            switch (op.args) {
-                // cancellable operations
-                .sleep,
-                .futex_wait,
-                => {
-                    // this queues the cancellation as a SQE, which will be
-                    // processed by the poll() loop like any other
-                    _ = op.loop.io_uring.timeout_remove(
-                        internal_cancel_userdata,
-                        @ptrToInt(op),
-                        0,
-                    ) catch |err| {
-                        std.debug.panic("timeout_remove failed: {s}", .{err});
-                    };
-                },
-                .accept,
-                .connect,
-                .recv,
-                .send,
-                => {
-                    // this queues the cancellation as a SQE, which will be
-                    // processed by the poll() loop like any other
-                    _ = op.loop.io_uring.cancel(
-                        internal_cancel_userdata,
-                        @ptrToInt(op),
-                        0,
-                    ) catch |err| {
-                        std.debug.panic("cancellation failed: {s}", .{err});
-                    };
-                },
-            }
+            op.loop.cancelq.insert(op);
         }
 
         pub fn cancelToken(op: *Self) CancelToken {

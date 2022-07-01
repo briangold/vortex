@@ -29,7 +29,7 @@ pub const Config = struct {
 pub const DefaultScheduler = SchedulerImpl(clock.DefaultClock);
 pub const SimScheduler = SchedulerImpl(clock.SimClock);
 
-threadlocal var currentTaskId: ?Task.Index = null;
+threadlocal var current_task_id: ?Task.Index = null;
 
 const Task = struct {
     const Index = usize; // TODO trim this down?
@@ -90,7 +90,7 @@ fn SchedulerImpl(comptime C: type) type {
 
         pub const Clock = C;
 
-        const TaskId = Task.Index;
+        pub const TaskId = Task.Index;
         const TaskList = FwdIndexedList(Task, .next);
         const SiblingList = FwdIndexedList(Task, .sibling);
         const TaskQueue = ConcurrentArrayQueue(TaskId);
@@ -172,8 +172,8 @@ fn SchedulerImpl(comptime C: type) type {
                 assert(task.state == .runnable);
                 task.state = .executing;
 
-                assert(currentTaskId == null);
-                currentTaskId = tid;
+                assert(current_task_id == null);
+                current_task_id = tid;
 
                 assert(task.frame != null);
                 const toresume = task.frame.?;
@@ -185,7 +185,7 @@ fn SchedulerImpl(comptime C: type) type {
                 // the fields in "task", as the task may have suspended itself
                 // and been rescheduled on another thread already. All we can
                 // reliably say here is that task 'tid' returned and that
-                // currentTaskId (for this worker thread) is null.
+                // current_task_id (for this worker thread) is null.
 
                 // NOTE: the delta from start may include OS overhead to
                 // reschedule the worker thread.
@@ -193,7 +193,7 @@ fn SchedulerImpl(comptime C: type) type {
 
                 // When we return back here after resuming, the task must have
                 // yielded the worker thread.
-                assert(currentTaskId == null);
+                assert(current_task_id == null);
 
                 self.emitEvent(TaskYieldEvent, .{
                     .tid = tid,
@@ -202,6 +202,12 @@ fn SchedulerImpl(comptime C: type) type {
             }
 
             return count;
+        }
+
+        /// Returns the currently scheduled task id. Must be called from a
+        /// task context (user code) where task id is guaranteed to be valid.
+        pub fn currentTaskId(_: *Scheduler) TaskId {
+            return current_task_id.?;
         }
 
         /// Spawns the special 'init' task. To be run inside a suspend block,
@@ -257,6 +263,8 @@ fn SchedulerImpl(comptime C: type) type {
 
             const tid = self.descheduleCurrentTask(@frame());
             var task = &self.tasks[tid];
+
+            self.emitEvent(TaskSuspendEvent, .{ .task = task });
 
             // adjust the timeout based on task deadline
             const timeout = std.math.min(req_timeout, task.deadline);
@@ -398,7 +406,7 @@ fn SchedulerImpl(comptime C: type) type {
         /// Internal helper: returns TaskCancelled if the currently running
         /// task was cancelled, or TaskTimeout if the task is over its deadline.
         fn propagateErrors(self: *Scheduler) !void {
-            const task = &self.tasks[currentTaskId.?];
+            const task = &self.tasks[current_task_id.?];
 
             // Cancellation takes precendence
             if (task.cancelled) {
@@ -417,9 +425,9 @@ fn SchedulerImpl(comptime C: type) type {
         /// actual suspend operation (either an explicit suspend or an await).
         /// Returns the id of the suspended task.
         fn descheduleCurrentTask(self: *Scheduler, frame: ?anyframe) TaskId {
-            assert(currentTaskId != null);
-            const tid = currentTaskId.?;
-            currentTaskId = null;
+            assert(current_task_id != null);
+            const tid = current_task_id.?;
+            current_task_id = null;
 
             ztracy.FiberLeave();
 
@@ -504,7 +512,7 @@ fn SchedulerImpl(comptime C: type) type {
 
             // Note: the SpawnHandle is responsible for freeing the task
             // when it completes (whatever the cause).
-            const tid = try self.allocTask(currentTaskId.?, timeout);
+            const tid = try self.allocTask(current_task_id.?, timeout);
 
             spawnHandlePtr.* = Handle{
                 .sched = self,
@@ -542,7 +550,7 @@ fn SchedulerImpl(comptime C: type) type {
                     }
 
                     // now running as spawned task
-                    assert(currentTaskId == tid);
+                    assert(current_task_id == tid);
 
                     // Ensure we return having completed this task.  We use a
                     // defer block as there are multiple return paths below
@@ -551,7 +559,7 @@ fn SchedulerImpl(comptime C: type) type {
                         // Because the task can hit an I/O error while suspended
                         // in the scheduler, it may have already been
                         // descheduled.
-                        if (currentTaskId != null) {
+                        if (current_task_id != null) {
                             _ = sched.descheduleCurrentTask(null);
                         }
 
@@ -868,6 +876,7 @@ const ScopedRegistry = EventRegistry("vx.sched", enum {
     thread_start,
     init_spawned,
     init_joined,
+    task_suspend,
     task_resume,
     task_yield,
     task_spawned,
@@ -880,6 +889,9 @@ const ScopedRegistry = EventRegistry("vx.sched", enum {
 const ThreadStartEvent = ScopedRegistry.register(.thread_start, .debug, struct {});
 const InitSpawnedEvent = ScopedRegistry.register(.init_spawned, .debug, struct {});
 const InitJoinedEvent = ScopedRegistry.register(.init_joined, .debug, struct {});
+const TaskSuspendEvent = ScopedRegistry.register(.task_suspend, .debug, struct {
+    task: *Task,
+});
 const TaskResumeEvent = ScopedRegistry.register(.task_resume, .debug, struct {
     task: *Task,
 });
@@ -955,7 +967,7 @@ test "Scheduler unit" {
 
             // simple validations of our now-running init task
             const task = &sched.tasks[tid];
-            try std.testing.expect(currentTaskId.? == tid);
+            try std.testing.expect(current_task_id.? == tid);
             try std.testing.expect(task.state == .executing);
 
             var op = MockOp{};
