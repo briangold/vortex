@@ -9,7 +9,7 @@ pub fn Impl(comptime R: type) type {
     return struct {
         const Self = @This();
         const Runtime = R;
-        const Platform = R.IoLoop;
+        const Platform = R.Platform;
 
         pub const PipePair = struct {
             rt: *Runtime,

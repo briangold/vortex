@@ -4,12 +4,12 @@ pub fn Config(comptime Runtime: type) type {
     return struct {
         const SchedulerConfig = @import("scheduler.zig").Config;
         const SyncEventWriter = @import("event.zig").SyncEventWriter;
-        const IoConfig = Runtime.IoLoop.Config;
+        const PlatformConfig = Runtime.Platform.Config;
 
         const Self = @This();
 
         /// I/O engine configuration
-        io: IoConfig = IoConfig{},
+        platform: PlatformConfig = PlatformConfig{},
 
         /// Scheduler configuration
         scheduler: SchedulerConfig = SchedulerConfig{},

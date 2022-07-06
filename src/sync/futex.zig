@@ -15,7 +15,7 @@ const Timespec = clock.Timespec;
 const max_time = clock.max_time;
 
 pub fn Futex(comptime Runtime: type) type {
-    const FutexEvent = Runtime.IoLoop.FutexEvent;
+    const FutexEvent = Runtime.Platform.FutexEvent;
 
     return struct {
         /// Checks if `ptr` still contains the value `expect` and, if so, blocks

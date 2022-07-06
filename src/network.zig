@@ -23,12 +23,12 @@ pub fn Impl(comptime R: type) type {
     return struct {
         const Self = @This();
         const Runtime = R;
-        const IoLoop = R.IoLoop;
+        const Platform = R.Platform;
 
         pub const Listener = struct {
             rt: *Runtime,
             addr: std.net.Address,
-            fd: IoLoop.Descriptor,
+            fd: Platform.Descriptor,
 
             pub const InitError = anyerror; // TODO: narrow
 
@@ -113,7 +113,7 @@ pub fn Impl(comptime R: type) type {
 
         pub const Stream = struct {
             rt: *Runtime,
-            fd: IoLoop.Descriptor,
+            fd: Platform.Descriptor,
             peer: std.net.Address,
 
             pub const ConnectError = anyerror; // TODO: narrow

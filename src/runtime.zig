@@ -19,12 +19,12 @@ pub fn threadId() usize {
 pub const SimRuntime = RuntimeImpl(platform.SimPlatform);
 pub const DefaultRuntime = RuntimeImpl(platform.DefaultPlatform);
 
-pub fn RuntimeImpl(comptime Loop: type) type {
+pub fn RuntimeImpl(comptime P: type) type {
     return struct {
         const Runtime = @This();
 
-        pub const IoLoop = Loop;
-        pub const Scheduler = IoLoop.Scheduler;
+        pub const Platform = P;
+        pub const Scheduler = Platform.Scheduler;
         pub const Clock = Scheduler.Clock;
         pub const Config = @import("config.zig").Config(Runtime);
 
@@ -48,7 +48,7 @@ pub fn RuntimeImpl(comptime Loop: type) type {
             for (threads) |*thread| {
                 thread.* = try WorkerThread.init(
                     alloc,
-                    config.io,
+                    config.platform,
                     sched,
                     emitter,
                 );
@@ -142,22 +142,22 @@ pub fn RuntimeImpl(comptime Loop: type) type {
             assert(self.sched.runqueue.empty()); // no runnable tasks
         }
 
-        pub fn io(self: *Runtime) *IoLoop {
+        pub fn io(self: *Runtime) *Platform {
             return &self.threads[threadId()].loop;
         }
 
         const WorkerThread = struct {
-            loop: IoLoop,
+            loop: Platform,
             handle: ?std.Thread = null,
 
             fn init(
                 alloc: std.mem.Allocator,
-                config: IoLoop.Config,
+                config: Platform.Config,
                 sched: *Scheduler,
                 emitter: *Emitter,
             ) !WorkerThread {
                 return WorkerThread{
-                    .loop = try IoLoop.init(alloc, config, sched, emitter),
+                    .loop = try Platform.init(alloc, config, sched, emitter),
                 };
             }
 
