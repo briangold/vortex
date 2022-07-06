@@ -132,7 +132,7 @@ optimizations](https://zig.news/kprotty/resource-efficient-thread-pools-with-zig
 - [ ] File APIs
   - [ ] posix by default, backed by thread pool
   - [ ] io_uring where possible
-- [ ] Signals
+- [x] Signals
 
 ## Longer term
 
