@@ -162,7 +162,7 @@ pub fn Impl(comptime R: type) type {
             }
 
             pub fn recv(
-                self: *Stream,
+                self: Stream,
                 buf: []u8,
                 timeout_ns: ?Timespec,
             ) !usize {
@@ -175,7 +175,7 @@ pub fn Impl(comptime R: type) type {
             }
 
             pub fn send(
-                self: *Stream,
+                self: Stream,
                 buf: []const u8,
                 timeout_ns: ?Timespec,
             ) !usize {

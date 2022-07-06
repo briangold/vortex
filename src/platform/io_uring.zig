@@ -173,6 +173,8 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
                     .connect,
                     .recv,
                     .send,
+                    .read,
+                    .write,
                     => {
                         // this queues the cancellation as a SQE, which will be
                         // processed by the poll() loop like any other
@@ -292,6 +294,48 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
                         .fd = fd,
                         .buffer = buffer,
                         .flags = flags,
+                    },
+                },
+            };
+            try platform.sched.suspendTask(timeout, &op);
+            return op.complete();
+        }
+
+        pub fn read(
+            platform: *Platform,
+            fd: Descriptor,
+            buffer: []u8,
+            offset: u64,
+            timeout: Timespec,
+        ) !usize {
+            var op = IoOperation{
+                .platform = platform,
+                .args = .{
+                    .read = .{
+                        .fd = fd,
+                        .buffer = buffer,
+                        .offset = offset,
+                    },
+                },
+            };
+            try platform.sched.suspendTask(timeout, &op);
+            return op.complete();
+        }
+
+        pub fn write(
+            platform: *Platform,
+            fd: Descriptor,
+            buffer: []const u8,
+            offset: u64,
+            timeout: Timespec,
+        ) !usize {
+            var op = IoOperation{
+                .platform = platform,
+                .args = .{
+                    .write = .{
+                        .fd = fd,
+                        .buffer = buffer,
+                        .offset = offset,
                     },
                 },
             };
@@ -439,6 +483,16 @@ fn IoOperationImpl(comptime Platform: type) type {
                 buffer: []const u8,
                 flags: u32,
             },
+            read: struct {
+                fd: Descriptor,
+                buffer: []u8,
+                offset: u64,
+            },
+            write: struct {
+                fd: Descriptor,
+                buffer: []const u8,
+                offset: u64,
+            },
         },
 
         pub fn prep(
@@ -580,6 +634,40 @@ fn IoOperationImpl(comptime Platform: type) type {
                         0, // relative timeout
                     );
                 },
+
+                .read => |*args| {
+                    var sqe = try op.platform.io_uring.read(
+                        @ptrToInt(op),
+                        args.fd,
+                        .{ .buffer = args.buffer },
+                        args.offset,
+                    );
+
+                    sqe.flags |= std.os.linux.IOSQE_IO_LINK;
+
+                    _ = try op.platform.io_uring.link_timeout(
+                        internal_link_timeout_userdata,
+                        &op.timeout,
+                        0, // relative timeout
+                    );
+                },
+
+                .write => |*args| {
+                    var sqe = try op.platform.io_uring.write(
+                        @ptrToInt(op),
+                        args.fd,
+                        args.buffer,
+                        args.offset,
+                    );
+
+                    sqe.flags |= std.os.linux.IOSQE_IO_LINK;
+
+                    _ = try op.platform.io_uring.link_timeout(
+                        internal_link_timeout_userdata,
+                        &op.timeout,
+                        0, // relative timeout
+                    );
+                },
             }
         }
 
@@ -711,6 +799,46 @@ fn IoOperationImpl(comptime Platform: type) type {
                         return @intCast(usize, op.completion.result);
                     }
                 },
+
+                .read => {
+                    if (op.completion.result < 0) {
+                        return switch (@intToEnum(std.os.E, -op.completion.result)) {
+                            .AGAIN => error.WouldBlock,
+                            .BADF => error.FileDescriptorInvalid,
+                            .FAULT => unreachable,
+                            .INTR => unreachable,
+                            .INVAL => unreachable,
+                            .NOMEM => error.SystemResources,
+                            .IO => error.InputOutput,
+                            else => |errno| std.os.unexpectedErrno(errno),
+                        };
+                    } else {
+                        return @intCast(usize, op.completion.result);
+                    }
+                },
+
+                .write => {
+                    if (op.completion.result < 0) {
+                        return switch (@intToEnum(std.os.E, -op.completion.result)) {
+                            .AGAIN => error.WouldBlock,
+                            .BADF => error.FileDescriptorInvalid,
+                            .DESTADDRREQ => unreachable,
+                            .DQUOT => error.DiskQuota,
+                            .FAULT => unreachable,
+                            .FBIG => error.FileTooBig,
+                            .INTR => unreachable,
+                            .INVAL => unreachable,
+                            .IO => error.InputOutput,
+                            .NOMEM => error.SystemResources,
+                            .NOSPC => error.NoSpaceLeft,
+                            .PERM => error.AccessDenied,
+                            .PIPE => error.BrokenPipe,
+                            else => |errno| std.os.unexpectedErrno(errno),
+                        };
+                    } else {
+                        return @intCast(usize, op.completion.result);
+                    }
+                },
             }
         }
 
@@ -746,6 +874,12 @@ fn IoOperationImpl(comptime Platform: type) type {
                     try writer.print(" fd={d}", .{args.fd});
                 },
                 .send => |args| {
+                    try writer.print(" fd={d}", .{args.fd});
+                },
+                .read => |args| {
+                    try writer.print(" fd={d}", .{args.fd});
+                },
+                .write => |args| {
                     try writer.print(" fd={d}", .{args.fd});
                 },
             }

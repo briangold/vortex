@@ -264,15 +264,24 @@ fn SchedulerImpl(comptime C: type) type {
             const tid = self.descheduleCurrentTask(@frame());
             var task = &self.tasks[tid];
 
-            self.emitEvent(TaskSuspendEvent, .{ .task = task });
+            task.io_token = op.cancelToken();
 
             // adjust the timeout based on task deadline
             const timeout = std.math.min(req_timeout, task.deadline);
 
-            task.io_token = op.cancelToken();
+            self.emitEvent(TaskSuspendEvent, .{ .task = task });
 
             suspend {
-                try op.prep(timeout, wrap, self, tid);
+                // Now that the io_token is set, check for cancellation before
+                // going async. If we are not cancelled (normal case), proceed
+                // to issue the I/O operation. If we are cancelled, invoke the
+                // reschedule callback as though the operation had completed,
+                // as we will pick up the error at the end of this function.
+                if (!task.cancelled) {
+                    try op.prep(timeout, wrap, self, tid);
+                } else {
+                    wrap(self, tid);
+                }
             }
 
             task.io_token = null;
@@ -508,7 +517,15 @@ fn SchedulerImpl(comptime C: type) type {
             // SpawnHandle, then pass that variable's location here for
             // initialization. With improvements in RLS we can likely improve
             // the ergonomics.
-            const Handle = @TypeOf(spawnHandlePtr.*);
+            const Ptr = @TypeOf(spawnHandlePtr.*);
+
+            // Allow passing a *?SpawnHandle as a convenience. This unwraps
+            // the true Handle type.
+            const Handle = switch (@typeInfo(Ptr)) {
+                .Optional => @TypeOf(spawnHandlePtr.*.?),
+                .Struct => Ptr,
+                else => @compileError("Invalid type passed to spawn"),
+            };
 
             // Note: the SpawnHandle is responsible for freeing the task
             // when it completes (whatever the cause).
@@ -518,7 +535,12 @@ fn SchedulerImpl(comptime C: type) type {
                 .sched = self,
                 .tid = tid,
             };
-            spawnHandlePtr.start(args);
+
+            switch (@typeInfo(Ptr)) {
+                .Optional => spawnHandlePtr.*.?.start(args),
+                .Struct => spawnHandlePtr.start(args),
+                else => unreachable,
+            }
         }
 
         fn SpawnHandleImpl(

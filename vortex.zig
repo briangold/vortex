@@ -22,6 +22,7 @@ const EventRegistry = @import("src/event.zig").EventRegistry;
 const clock = @import("src/clock.zig");
 const metricslib = @import("src/metrics.zig");
 const network = @import("src/network.zig");
+const pipe = @import("src/pipe.zig");
 const runtime = @import("src/runtime.zig");
 
 pub const Vortex = if (@hasDecl(root, "Runtime"))
@@ -144,6 +145,16 @@ fn VortexImpl(comptime R: type) type {
             }
         };
 
+        pub const ipc = struct {
+            pub const PipePair = pipe.Impl(R).PipePair;
+
+            /// Open a pipe, creating a read and write pair that can be accessed
+            /// from different contexts (usually between processes).
+            pub fn openPipe() !PipePair {
+                return PipePair.init(&_instance);
+            }
+        };
+
         /// Synchronization methods
         pub const sync = struct {
             const Atomic = std.atomic.Atomic;
@@ -167,6 +178,31 @@ fn VortexImpl(comptime R: type) type {
 
             /// Task-aware barrier synchronization
             pub const Barrier = @import("src/sync/barrier.zig").Barrier(Futex);
+        };
+
+        /// Signals
+        pub const signal = struct {
+            pub const SupportedSignal = @import("src/signal.zig").SupportedSignal;
+
+            pub const SignalReader = struct {
+                fd: std.os.fd_t,
+
+                pub fn wait(sr: SignalReader, timeout_ns: ?Timespec) !void {
+                    // read from the pipe, likely going async
+                    var byte: [1]u8 = undefined;
+                    const timeout = timeout_ns orelse clock.max_time;
+                    _ = try _instance.io().read(sr.fd, &byte, 0, timeout);
+
+                    // TODO: test byte is magic value?
+                }
+            };
+
+            pub fn register(sig: SupportedSignal) !SignalReader {
+                // register signal handler and get read-pipe fd
+                return SignalReader{
+                    .fd = try _instance.signal_junction.register(sig),
+                };
+            }
         };
 
         /// Metrics tracking
@@ -225,11 +261,14 @@ fn VortexImpl(comptime R: type) type {
 }
 
 test "api" {
-    _ = @import("tests/timer.zig"); // TODO: re-enable Sim tests
-    _ = @import("tests/task.zig"); // TODO: re-enable Sim tests
-    _ = @import("tests/cancel.zig"); // TODO: re-enable Sim tests
+    // TODO: re-enable Sim tests
+    _ = @import("tests/timer.zig");
+    _ = @import("tests/task.zig");
+    _ = @import("tests/cancel.zig");
     _ = @import("tests/tcp.zig");
+    _ = @import("tests/pipe.zig");
     _ = @import("tests/futex.zig");
     _ = @import("tests/barrier.zig");
     _ = @import("tests/select.zig");
+    _ = @import("tests/signal.zig");
 }

@@ -397,6 +397,68 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
             }
         }
 
+        pub fn read(
+            platform: *Platform,
+            fd: Descriptor,
+            buffer: []u8,
+            offset: u64,
+            timeout: Timespec,
+        ) !usize {
+            while (true) {
+                var op = IoOperation{
+                    .platform = platform,
+                    .args = .{ .read = .{ .fd = fd } },
+                };
+
+                // Janky: pipes only support read() and require offset to be 0,
+                // so use read() when offset is 0 and pread() otherwise.
+                const res = if (offset > 0)
+                    std.os.pread(fd, buffer, offset)
+                else
+                    std.os.read(fd, buffer);
+
+                if (res) |count| {
+                    return count;
+                } else |err| switch (err) {
+                    error.WouldBlock => {
+                        try platform.wait(&op, timeout);
+                    },
+                    else => return err,
+                }
+            }
+        }
+
+        pub fn write(
+            platform: *Platform,
+            fd: Descriptor,
+            buffer: []const u8,
+            offset: u64,
+            timeout: Timespec,
+        ) !usize {
+            while (true) {
+                var op = IoOperation{
+                    .platform = platform,
+                    .args = .{ .send = .{ .fd = fd } },
+                };
+
+                // Janky: pipes only support write() and require offset to be 0,
+                // so use write() when offset is 0 and pwrite() otherwise.
+                const res = if (offset > 0)
+                    std.os.pwrite(fd, buffer, offset)
+                else
+                    std.os.write(fd, buffer);
+
+                if (res) |count| {
+                    return count;
+                } else |err| switch (err) {
+                    error.WouldBlock => {
+                        try platform.wait(&op, timeout);
+                    },
+                    else => return err,
+                }
+            }
+        }
+
         fn wait(
             platform: *Platform,
             op: *IoOperation,
@@ -564,7 +626,7 @@ const EpollPoller = struct {
         comptime ctlop: CtlOp,
         fd: Descriptor,
     ) !void {
-        const epoll = std.os.system.EPOLL;
+        const epoll = std.os.linux.EPOLL;
 
         const op = switch (ctlop) {
             .add => epoll.CTL_ADD,
@@ -583,8 +645,8 @@ const EpollPoller = struct {
         event: OsEvent,
 
         pub fn readiness(ev: Event) Readiness {
-            const rd = (ev.event.events & std.os.system.EPOLL.IN) != 0;
-            const wr = (ev.event.events & std.os.system.EPOLL.OUT) != 0;
+            const rd = (ev.event.events & std.os.linux.EPOLL.IN) != 0;
+            const wr = (ev.event.events & std.os.linux.EPOLL.OUT) != 0;
 
             if (rd and wr) return .rdwr;
             if (rd) return .rd;
@@ -777,6 +839,12 @@ fn IoOperationImpl(comptime Platform: type) type {
             send: struct {
                 fd: Descriptor,
             },
+            read: struct {
+                fd: Descriptor,
+            },
+            write: struct {
+                fd: Descriptor,
+            },
         },
 
         fn descriptor(op: *const IoOperation) ?Descriptor {
@@ -786,6 +854,8 @@ fn IoOperationImpl(comptime Platform: type) type {
                 .connect => |args| args.fd,
                 .recv => |args| args.fd,
                 .send => |args| args.fd,
+                .read => |args| args.fd,
+                .write => |args| args.fd,
             };
         }
 
@@ -822,8 +892,8 @@ fn IoOperationImpl(comptime Platform: type) type {
 
             const rdy = switch (op.args) {
                 .sleep, .futex_wait => Readiness.none,
-                .accept, .recv => Readiness.rd,
-                .connect, .send => Readiness.wr,
+                .accept, .recv, .read => Readiness.rd,
+                .connect, .send, .write => Readiness.wr,
             };
 
             switch (op.args) {
@@ -863,7 +933,7 @@ fn IoOperationImpl(comptime Platform: type) type {
                     }
                 },
 
-                .accept, .connect, .send, .recv => {
+                .accept, .connect, .recv, .send, .read, .write => {
                     const fd = op.descriptor() orelse unreachable;
                     if (op.platform.fdt.submitEntry(idx, fd, rdy)) {
                         // lazily add new fd's to poller

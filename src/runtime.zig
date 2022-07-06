@@ -6,6 +6,7 @@ const platform = @import("platform.zig");
 const scheduler = @import("scheduler.zig");
 const Emitter = @import("event.zig").Emitter;
 const EventRegistry = @import("event.zig").EventRegistry;
+const SignalJunction = @import("signal.zig").SignalJunction;
 
 const ztracy = @import("ztracy");
 
@@ -31,6 +32,7 @@ pub fn RuntimeImpl(comptime Loop: type) type {
         clock: *Clock,
         sched: *Scheduler,
         threads: []WorkerThread,
+        signal_junction: *SignalJunction,
 
         pub fn init(alloc: std.mem.Allocator, config: Config) !Runtime {
             var emitter = try alloc.create(Emitter);
@@ -52,20 +54,26 @@ pub fn RuntimeImpl(comptime Loop: type) type {
                 );
             }
 
+            var signal_junction = try alloc.create(SignalJunction);
+            try SignalJunction.init(signal_junction);
+
             return Runtime{
                 .emitter = emitter,
                 .clock = clk,
                 .sched = sched,
                 .threads = threads,
+                .signal_junction = signal_junction,
             };
         }
 
         pub fn deinit(self: *Runtime, alloc: std.mem.Allocator) void {
+            self.signal_junction.deinit();
             for (self.threads) |*thread| {
                 thread.deinit(alloc);
             }
             self.sched.deinit(alloc);
 
+            alloc.destroy(self.signal_junction);
             alloc.free(self.threads);
             alloc.destroy(self.sched);
             alloc.destroy(self.clock);

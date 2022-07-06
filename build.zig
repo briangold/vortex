@@ -21,6 +21,8 @@ pub fn addVortexPackage(
     const tracy_pkg = ztracy.getPkg(b, options_pkg);
 
     libexe.addPackage(getVortexPkg(&[_]std.build.Pkg{tracy_pkg}));
+    libexe.linkLibC();
+
     ztracy.link(libexe, options.enable_tracy, .{ .fibers = true });
 }
 
@@ -152,6 +154,7 @@ pub fn build(b: *Builder) !void {
 
     const main_tests = b.addTest("vortex.zig");
     main_tests.setBuildMode(mode);
+    main_tests.linkLibC();
 
     const test_opt = b.addOptions();
     test_opt.addOption(bool, "enable_tracy", false);

@@ -12,7 +12,7 @@ const Server = struct {
     addr: std.net.Address,
     msg_size: usize,
 
-    fn session(server: *@This(), stream: *vx.net.TcpStream) !void {
+    fn session(server: *@This(), stream: vx.net.TcpStream) !void {
         vx.event.emit(SessionStartEvent, .{ .addr = stream.peer });
         defer vx.event.emit(SessionEndEvent, .{ .addr = stream.peer });
 
@@ -33,29 +33,60 @@ const Server = struct {
         }
     }
 
-    fn start(server: *@This()) !void {
-        vx.event.emit(ServerStartEvent, .{ .addr = server.addr });
-
+    fn listen(server: *@This()) !void {
         var l = try vx.net.startTcpListener(server.addr, 64);
         defer l.close();
 
         // TODO: conslidate client & server and share constants
         const max_clients = 1024;
-        const State = struct {
-            stream: vx.net.TcpStream,
-            task: vx.task.SpawnHandle(session),
-        };
-        var clients: [max_clients]State = undefined;
+        var clients = [_]?vx.task.SpawnHandle(session){null} ** max_clients;
 
-        for (clients) |*client| {
-            // accept a connection on the listener
-            client.stream = try l.accept(null);
-
-            // spawn a new task for the session
-            try vx.task.spawn(&client.task, .{ server, &client.stream }, null);
+        // Defer task joining so even if the listen task is cancelled this
+        // block will run.
+        defer {
+            for (clients) |*maybe_client| {
+                if (maybe_client.*) |*client| {
+                    client.join() catch |err| switch (err) {
+                        error.TaskCancelled => {},
+                        else => std.debug.panic("Unable to join session task: {}", .{err}),
+                    };
+                }
+            }
         }
 
-        // NOTE: for now we do not have a clean shutdown for the server
+        for (clients) |*client| {
+            // Wait for new client connection
+            const stream = try l.accept(null);
+
+            // Spawn a new task for the session
+            // Note: spawn sets client.*, dropping the optional guard
+            try vx.task.spawn(client, .{ server, stream }, null);
+        }
+    }
+
+    fn shutdown(reader: vx.signal.SignalReader) !void {
+        try reader.wait(null);
+    }
+
+    fn start(server: *@This()) !void {
+        vx.event.emit(ServerStartEvent, .{ .addr = server.addr });
+
+        // register handler for SIGINT (ctrl-c)
+        const sig_reader = try vx.signal.register(.sigint);
+
+        var lh: vx.task.SpawnHandle(listen) = undefined;
+        try vx.task.spawn(&lh, .{server}, null);
+
+        var sh: vx.task.SpawnHandle(shutdown) = undefined;
+        try vx.task.spawn(&sh, .{sig_reader}, null);
+
+        switch (try vx.task.select(.{
+            .listen = &lh,
+            .shutdown = &sh,
+        })) {
+            .listen => @panic("Listener exited unexpectedly"),
+            .shutdown => vx.event.emit(ServerShutdownEvent, .{}),
+        }
     }
 };
 
@@ -217,6 +248,7 @@ pub fn main() !void {
 
 const ScopedRegistry = vx.event.Registry("demo.echo", enum {
     server_start,
+    server_shutdown,
     session_start,
     session_end,
     client_start,
@@ -226,6 +258,8 @@ const ScopedRegistry = vx.event.Registry("demo.echo", enum {
 const ServerStartEvent = ScopedRegistry.register(.server_start, .info, struct {
     addr: std.net.Address,
 });
+
+const ServerShutdownEvent = ScopedRegistry.register(.server_shutdown, .info, struct {});
 
 const SessionStartEvent = ScopedRegistry.register(.session_start, .info, struct {
     addr: std.net.Address,
