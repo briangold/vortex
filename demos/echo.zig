@@ -51,7 +51,13 @@ const Server = struct {
         defer server.alloc.free(workers);
 
         // spawn connection pool
-        for (workers) |*w| try vx.task.spawn(w, .{server}, null);
+        for (workers) |*w, i| {
+            // If spawn fails in a loop, the parent task will attempt to
+            // cancel tasks that haven't been initialized properly, leading
+            // to a segfault. TODO: make this more ergonomic.
+            vx.task.spawn(w, .{server}, null) catch |err|
+                std.debug.panic("Unable to spawn worker {d}: {}", .{ i, err });
+        }
 
         // defer joining so when the listen task is cancelled this block runs
         defer {
@@ -66,6 +72,7 @@ const Server = struct {
         // main serving loop: accept a connection and push to session tasks
         while (true) {
             const stream = try l.accept(null);
+
             try server.chan.push(stream);
         }
     }

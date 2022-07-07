@@ -23,7 +23,7 @@ const ztracy = @import("ztracy");
 pub const Config = struct {
     /// Maximum number of spawned tasks, including the init task. Must be a
     /// power-of-2.
-    max_tasks: Task.Index = 128,
+    max_tasks: Task.Index = 1024,
 };
 
 pub const DefaultScheduler = SchedulerImpl(clock.DefaultClock);
