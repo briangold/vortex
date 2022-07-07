@@ -11,71 +11,26 @@ const Ordering = std.atomic.Ordering;
 const cache_line_bytes = std.atomic.cache_line;
 
 /// Returns the concrete type of the queue holding type T. This public API
-/// uses a usize type for the queue's internal Index, safe for use in practice.
+/// uses a u32 type for the queue's internal Index, safe for use in practice
+/// and compatible with Futex operations.
 pub fn ConcurrentArrayQueue(comptime T: type) type {
-    return ConcurrentArrayQueueImpl(T, usize);
+    return ConcurrentArrayQueueImpl(T, u32, std.atomic.Atomic(u32));
 }
 
 /// The internal implementation, with narrower Index types, is useful for
 /// testing wraparound conditions. But concurrent accesses that wrap are
 /// vulnerable to subtle ABA problems in the queue, so for practical uses we
-/// expose only the usize-indexed version in ConcurrentArrayQueue.
-fn ConcurrentArrayQueueImpl(comptime T: type, comptime I: type) type {
+/// expose only the wider-indexed version in ConcurrentArrayQueue.
+fn ConcurrentArrayQueueImpl(
+    comptime T: type,
+    comptime I: type,
+    comptime AtomicIndex: type,
+) type {
     const index_info = @typeInfo(I).Int;
     comptime {
         assert(index_info.signedness == .unsigned);
         assert(index_info.bits > 0 and index_info.bits <= @typeInfo(usize).Int.bits);
     }
-
-    const AtomicIndex = struct {
-        const Self = @This();
-
-        // Promote the Index type to an extern-compatible type we can use with
-        // atomic instructions (e.g., u8, u16, u32, or u64).
-        const PromotedIndex = std.meta.Int(
-            .unsigned,
-            nextPowerOfTwoComptime(index_info.bits, 8),
-        );
-
-        v: PromotedIndex,
-
-        fn init(v: I) Self {
-            return .{ .v = v };
-        }
-
-        fn read(ai: *Self, comptime ord: Ordering) I {
-            // In real (non-test) cases, this intCast compiles away as I and
-            // PromotedIndex are equivalent.
-            return @intCast(I, @atomicLoad(PromotedIndex, &ai.v, ord));
-        }
-
-        fn write(ai: *Self, val: I, comptime ord: Ordering) void {
-            @atomicStore(PromotedIndex, &ai.v, val, ord);
-        }
-
-        fn cas(ai: *Self, exp: I, new: I, comptime succ: Ordering, comptime fail: Ordering) bool {
-            return @cmpxchgWeak(PromotedIndex, &ai.v, exp, new, succ, fail) == null;
-        }
-
-        fn fetch_add(ai: *Self, amt: I, comptime ord: Ordering) I {
-            if (I == PromotedIndex) {
-                // For our production use case, we can map to the language
-                // builtin because the two's complement addition will happen
-                // on the same type as our storage location.
-                return @atomicRmw(PromotedIndex, &ai.v, .Add, amt, ord);
-            } else {
-                // But in tests where we use a narrow type, we need to build
-                // our own fetch-and-add out of a CAS. Note that we should not
-                // be testing concurrent operations with this version, due to
-                // ABA problems, and only use the wider u32 or u64 based Index
-                // when running a concurrent test.
-                while (true) {
-                    const prev = ai.read(.Monotonic);
-                    if (ai.cas(prev, prev +% 1, ord, ord)) return prev;
-                }
-            }
-        }
-    };
 
     const Slot = struct {
         turn: AtomicIndex align(cache_line_bytes),
@@ -98,8 +53,6 @@ fn ConcurrentArrayQueueImpl(comptime T: type, comptime I: type) type {
         /// Constructs a queue using alloc to create the underlying array.
         /// Requires capacity to be a non-zero power of two.
         pub fn init(alloc: std.mem.Allocator, capacity: Index) !Queue {
-            _ = alloc;
-
             if (capacity == 0 or !std.math.isPowerOfTwo(capacity)) {
                 return error.BadQueueCapacity;
             }
@@ -129,38 +82,38 @@ fn ConcurrentArrayQueueImpl(comptime T: type, comptime I: type) type {
         /// Push an element onto the queue, potentially blocking until space
         /// is available. Use with caution!
         pub fn push(queue: *Queue, item: T) void {
-            const head = queue.head.fetch_add(1, .Monotonic);
+            const head = queue.head.fetchAdd(1, .Monotonic);
             const slot = &queue.slots[queue.idx(head)];
-            while (2 *% queue.turn(head) != slot.turn.read(.Acquire)) {
+            while (2 *% queue.turn(head) != slot.turn.load(.Acquire)) {
                 // blocking
             }
             slot.data = item;
-            slot.turn.write(2 *% queue.turn(head) +% 1, .Release);
+            slot.turn.store(2 *% queue.turn(head) +% 1, .Release);
         }
 
         /// Pop an element from the queue, potentially blocking on an empty
         /// queue until a new element is available. Use with caution!
         pub fn pop(queue: *Queue) T {
-            const tail = queue.tail.fetch_add(1, .Monotonic);
+            const tail = queue.tail.fetchAdd(1, .Monotonic);
             const slot = &queue.slots[queue.idx(tail)];
-            while (2 *% queue.turn(tail) +% 1 != slot.turn.read(.Acquire)) {
+            while (2 *% queue.turn(tail) +% 1 != slot.turn.load(.Acquire)) {
                 // blocking
             }
             const v = slot.data;
             slot.data = undefined;
-            slot.turn.write(2 *% queue.turn(tail) +% 2, .Release);
+            slot.turn.store(2 *% queue.turn(tail) +% 2, .Release);
             return v;
         }
 
         /// Attempt to push item into the queue, returning true if successful
         /// and false otherwise.
         pub fn try_push(queue: *Queue, item: T) bool {
-            var head = queue.head.read(.Monotonic);
+            var head = queue.head.load(.Monotonic);
             while (true) {
                 const slot = &queue.slots[queue.idx(head)];
-                const sturn = slot.turn.read(.Acquire);
+                const sturn = slot.turn.load(.Acquire);
                 if (2 *% queue.turn(head) == sturn) {
-                    if (queue.head.cas(head, head +% 1, .Monotonic, .Monotonic)) {
+                    if (queue.head.tryCompareAndSwap(head, head +% 1, .Monotonic, .Monotonic) == null) {
                         // NOTE: at this point, the head is updated, but until the
                         // slot.turn location is written, this thread is effectively
                         // holding a "lock" that can cause other threads to wait when
@@ -168,12 +121,12 @@ fn ConcurrentArrayQueueImpl(comptime T: type, comptime I: type) type {
                         // completes has the push completed.
                         slot.data = item;
                         const next = 2 *% queue.turn(head) +% 1;
-                        slot.turn.write(next, .Release);
+                        slot.turn.store(next, .Release);
                         return true;
                     }
                 } else {
                     const prev = head;
-                    head = queue.head.read(.Monotonic);
+                    head = queue.head.load(.Monotonic);
                     if (head == prev) return false;
                 }
             }
@@ -182,12 +135,12 @@ fn ConcurrentArrayQueueImpl(comptime T: type, comptime I: type) type {
         /// Attempt to pop an item from the queue, returning the value if
         /// successful and null otherwise.
         pub fn try_pop(queue: *Queue) ?T {
-            var tail = queue.tail.read(.Monotonic);
+            var tail = queue.tail.load(.Monotonic);
             while (true) {
                 const slot = &queue.slots[queue.idx(tail)];
-                const sturn = slot.turn.read(.Acquire);
+                const sturn = slot.turn.load(.Acquire);
                 if (2 *% queue.turn(tail) +% 1 == sturn) {
-                    if (queue.tail.cas(tail, tail +% 1, .Monotonic, .Monotonic)) {
+                    if (queue.tail.tryCompareAndSwap(tail, tail +% 1, .Monotonic, .Monotonic) == null) {
                         // NOTE: at this point, the tail is updated, but until the
                         // slot.turn location is written, this thread is effectively
                         // holding a "lock" that can cause other threads to wait when
@@ -196,19 +149,19 @@ fn ConcurrentArrayQueueImpl(comptime T: type, comptime I: type) type {
                         const v = slot.data;
                         const next = 2 *% queue.turn(tail) +% 2;
                         slot.data = undefined; // 0xaaaaa... in Debug builds
-                        slot.turn.write(next, .Release);
+                        slot.turn.store(next, .Release);
                         return v;
                     }
                 } else {
                     const prev = tail;
-                    tail = queue.tail.read(.Monotonic);
+                    tail = queue.tail.load(.Monotonic);
                     if (tail == prev) return null;
                 }
             }
         }
 
         pub fn size(queue: *Queue) Index {
-            return queue.head.read(.Monotonic) -% queue.tail.read(.Monotonic);
+            return queue.head.load(.Monotonic) -% queue.tail.load(.Monotonic);
         }
 
         pub fn empty(queue: *Queue) bool {
@@ -228,7 +181,50 @@ fn ConcurrentArrayQueueImpl(comptime T: type, comptime I: type) type {
 test "queue" {
     const alloc = std.testing.allocator;
 
-    const Q = ConcurrentArrayQueueImpl(u8, u2);
+    const I = u2;
+
+    const MockAtomicIndex = struct {
+        const Self = @This();
+
+        v: I,
+
+        fn init(v: I) Self {
+            comptime if (!builtin.is_test)
+                @compileError("Illegal use of ConcurrentArrayQueueImpl");
+            return .{ .v = v };
+        }
+
+        fn load(ai: *Self, comptime _: Ordering) I {
+            return ai.v;
+        }
+
+        fn store(ai: *Self, val: I, comptime _: Ordering) void {
+            ai.v = val;
+        }
+
+        fn tryCompareAndSwap(
+            ai: *Self,
+            exp: I,
+            new: I,
+            comptime _: Ordering,
+            comptime _: Ordering,
+        ) ?I {
+            if (ai.v == exp) {
+                ai.v = new;
+                return null;
+            } else {
+                return ai.v;
+            }
+        }
+
+        fn fetchAdd(ai: *Self, amt: I, comptime _: Ordering) I {
+            const prev = ai.v;
+            ai.v = prev +% amt;
+            return prev;
+        }
+    };
+
+    const Q = ConcurrentArrayQueueImpl(u8, I, MockAtomicIndex);
     try std.testing.expectError(error.BadQueueCapacity, Q.init(alloc, 0));
     try std.testing.expectError(error.BadQueueCapacity, Q.init(alloc, 3));
 

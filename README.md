@@ -111,7 +111,7 @@ optimizations](https://zig.news/kprotty/resource-efficient-thread-pools-with-zig
 - [ ] Synchronization
   - [x] Task-aware futex
   - [x] Barriers
-  - [ ] Channels
+  - [x] Channels
   - [ ] ResetEvent
   - [ ] Mutex, RWLock
 - [ ] Demos and benchmarks

@@ -176,6 +176,12 @@ fn VortexImpl(comptime R: type) type {
                 }
             };
 
+            /// Channels to communicate values between tasks
+            pub fn Channel(comptime T: type) type {
+                const Impl = @import("src/sync/channel.zig").Channel;
+                return Impl(T, Futex);
+            }
+
             /// Task-aware barrier synchronization
             pub const Barrier = @import("src/sync/barrier.zig").Barrier(Futex);
         };
@@ -271,4 +277,5 @@ test "api" {
     _ = @import("tests/barrier.zig");
     _ = @import("tests/select.zig");
     _ = @import("tests/signal.zig");
+    _ = @import("tests/channel.zig");
 }

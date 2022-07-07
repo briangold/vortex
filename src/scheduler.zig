@@ -130,8 +130,8 @@ fn SchedulerImpl(comptime C: type) type {
                 .admit = LimitCounter(usize).init(config.max_tasks),
                 .tasks = tasks,
                 .taskTree = taskTree,
-                .free = try TaskQueue.init(alloc, config.max_tasks),
-                .runqueue = try TaskQueue.init(alloc, config.max_tasks),
+                .free = try TaskQueue.init(alloc, @intCast(u32, config.max_tasks)),
+                .runqueue = try TaskQueue.init(alloc, @intCast(u32, config.max_tasks)),
             };
 
             var idx: Task.Index = 0;
