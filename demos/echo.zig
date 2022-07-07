@@ -6,30 +6,37 @@ const clap = @import("clap");
 
 const Timespec = vx.Timespec;
 const Histogram = vx.metrics.DefaultLog2HdrHistogram(Timespec);
+const TcpStreamChannel = vx.sync.Channel(vx.net.TcpStream);
 
 const Server = struct {
     alloc: std.mem.Allocator,
     addr: std.net.Address,
     msg_size: usize,
+    num_conn: usize,
+    chan: TcpStreamChannel,
 
-    fn session(server: *@This(), stream: vx.net.TcpStream) !void {
-        vx.event.emit(SessionStartEvent, .{ .addr = stream.peer });
-        defer vx.event.emit(SessionEndEvent, .{ .addr = stream.peer });
-
+    fn connWorker(server: *@This()) !void {
         var buf = try server.alloc.alloc(u8, server.msg_size);
         defer server.alloc.free(buf);
 
         while (true) {
-            const msg_zone = vx.tracing.ZoneNC(@src(), "Message handler", 0x00_ff_00_00);
-            defer msg_zone.End();
+            var stream = try server.chan.pop();
 
-            // await a message from the client
-            const rc = try stream.recv(buf, null);
-            if (rc == 0) break; // client disconnected
+            vx.event.emit(SessionStartEvent, .{ .addr = stream.peer });
+            defer vx.event.emit(SessionEndEvent, .{ .addr = stream.peer });
 
-            // send back what we received
-            const sc = try stream.send(buf[0..rc], null);
-            assert(rc == sc);
+            while (true) {
+                const msg_zone = vx.tracing.ZoneNC(@src(), "Message handler", 0x00_ff_00_00);
+                defer msg_zone.End();
+
+                // await a message from the client
+                const rc = try stream.recv(buf, null);
+                if (rc == 0) break; // client disconnected
+
+                // send back what we received
+                const sc = try stream.send(buf[0..rc], null);
+                assert(rc == sc);
+            }
         }
     }
 
@@ -37,30 +44,29 @@ const Server = struct {
         var l = try vx.net.startTcpListener(server.addr, 64);
         defer l.close();
 
-        // TODO: conslidate client & server and share constants
-        const max_clients = 1024;
-        var clients = [_]?vx.task.SpawnHandle(session){null} ** max_clients;
+        var workers = try server.alloc.alloc(
+            vx.task.SpawnHandle(connWorker),
+            server.num_conn,
+        );
+        defer server.alloc.free(workers);
 
-        // Defer task joining so even if the listen task is cancelled this
-        // block will run.
+        // spawn connection pool
+        for (workers) |*w| try vx.task.spawn(w, .{server}, null);
+
+        // defer joining so when the listen task is cancelled this block runs
         defer {
-            for (clients) |*maybe_client| {
-                if (maybe_client.*) |*client| {
-                    client.join() catch |err| switch (err) {
-                        error.TaskCancelled => {},
-                        else => std.debug.panic("Unable to join session task: {}", .{err}),
-                    };
-                }
+            for (workers) |*w| {
+                w.join() catch |err| switch (err) {
+                    error.TaskCancelled => {},
+                    else => std.debug.panic("Unable to join worker: {}", .{err}),
+                };
             }
         }
 
-        for (clients) |*client| {
-            // Wait for new client connection
+        // main serving loop: accept a connection and push to session tasks
+        while (true) {
             const stream = try l.accept(null);
-
-            // Spawn a new task for the session
-            // Note: spawn sets client.*, dropping the optional guard
-            try vx.task.spawn(client, .{ server, stream }, null);
+            try server.chan.push(stream);
         }
     }
 
@@ -172,7 +178,7 @@ pub fn main() !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help               Display this help and exit.
         \\-s, --server             Run an echo server on address:port
-        \\-c, --clients <usize>    Number of client connections to address:port
+        \\-c, --conn <usize>       Number of connections to address:port
         \\-m, --messages <usize>   Number of messages to send
         \\-p, --payload <usize>    Payload size (bytes)
         \\<address>
@@ -225,13 +231,18 @@ pub fn main() !void {
     defer vx.deinit(alloc);
 
     if (res.args.server) {
+        const chan_size = 16; // TODO: make this a CLI arg?
         var server = Server{
             .alloc = alloc,
             .addr = addr,
             .msg_size = res.args.payload orelse 64,
+            .num_conn = res.args.conn orelse 1,
+            .chan = try TcpStreamChannel.init(alloc, chan_size),
         };
+        defer server.chan.deinit(alloc);
+
         try vx.run(Server.start, .{&server});
-    } else if (res.args.clients) |num_clients| {
+    } else if (res.args.conn) |num_clients| {
         var client = Client{
             .alloc = alloc,
             .addr = addr,

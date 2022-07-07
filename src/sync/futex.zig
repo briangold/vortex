@@ -96,15 +96,17 @@ pub fn Futex(comptime Runtime: type) type {
                         // waiter on the stack would be invalidated and the
                         // waker task risks a UAF.
                         waiter.event.wait(null) catch |err2| switch (err2) {
-                            // Propagate TaskTimeout back, but a FutexTimeout
-                            // cannot occur here.
-                            error.TaskTimeout => return err2,
+                            // Propagate TaskTimeout or cancellation back, but
+                            // a FutexTimeout cannot occur here.
+                            error.TaskTimeout,
+                            error.TaskCancelled,
+                            => return err2,
                             else => unreachable,
                         };
                     }
                 },
 
-                else => std.debug.panic("unexpected error: {}\n", .{err}),
+                else => return err,
             };
         }
 
