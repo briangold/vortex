@@ -77,17 +77,25 @@ fn test_channel(
 
             var senders: [num_senders]SpawnHandle(sender) = undefined;
             for (senders) |*sh, i| {
-                try spawn(sh, .{ &c, i }, null);
+                spawn(sh, .{ &c, i }, null) catch |err|
+                    std.debug.panic("Error spawning sender: {}", .{err});
             }
 
             var receivers: [num_receivers]SpawnHandle(receiver) = undefined;
             for (receivers) |*rh| {
-                try spawn(rh, .{&c}, null);
+                spawn(rh, .{&c}, null) catch |err|
+                    std.debug.panic("Error spawning receiver: {}", .{err});
             }
 
             var sum: usize = 0;
-            for (senders) |*sh| try sh.join();
-            for (receivers) |*rh| sum += try rh.join();
+            for (senders) |*sh| {
+                sh.join() catch |err|
+                    std.debug.panic("Error joining sender: {}", .{err});
+            }
+            for (receivers) |*rh| {
+                sum += rh.join() catch |err|
+                    std.debug.panic("Error joining receiver: {}", .{err});
+            }
 
             try std.testing.expectEqual(
                 @as(usize, num_messages * (num_messages - 1) / 2),
@@ -103,7 +111,8 @@ test "channel" {
     // also validates ordering on the channel
     try test_spsc(vortex.Vortex);
 
-    try test_channel(vortex.Vortex, 16, 1, 8, 1024); // SPMC
-    try test_channel(vortex.Vortex, 16, 8, 1, 1024); // MPSC
-    try test_channel(vortex.Vortex, 16, 8, 8, 1024); // MPMC
+    try test_channel(vortex.Vortex, 16, 1, 128, 1024); // SPMC
+    try test_channel(vortex.Vortex, 16, 1, 128, 1024); // SPMC
+    try test_channel(vortex.Vortex, 16, 128, 1, 1024); // MPSC
+    try test_channel(vortex.Vortex, 16, 128, 128, 1024); // MPMC
 }

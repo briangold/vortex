@@ -9,25 +9,25 @@ pub fn DefaultLog2HdrHistogram(comptime T: type) type {
 
 /// Tracks a metric in a high-dynamic range histogram, similar to that used in
 /// Gil Tene's HdrHistogram and in the fio latency histogram.
-/// 
+///
 /// Basic idea: We want to have finer resolution in bucket widths for smaller
-/// values from T so we have smaller *relative* errors. We get this by 
+/// values from T so we have smaller *relative* errors. We get this by
 /// progressively widening the buckets. The tradeoffs we make are (a) we want to
 /// know how to bound the relative error in a bucket, (b) we want to limit the
 /// amount of memory required to store the buckets, (c) we want to limit the
 /// cost of computing indexes in the buckets, and (d) we want to avoid placing
 /// all the items in the largest bucket (i.e., having a poor configuration that
 /// doesn't represent the true distribution well).
-/// 
+///
 /// The scheme implemented here prioritizes (a) and (c), with moderate limits on
 /// memory (b) and no consideration for (d). Other schemes, especially DDSketch,
 /// may be better suited for other applications.
-/// 
-/// Implementation notes: we will form G groups of N buckets, where the buckets 
+///
+/// Implementation notes: we will form G groups of N buckets, where the buckets
 /// in a given group have the same resolution. Groups 0 and 1 have precise
 /// mapping, i.e. a resolution of 1 item from the domain of T. Group 2 doubles
 /// the width of each bucket, group 3 doubles that, and so on.
-/// 
+///
 /// Parametrized by:
 ///   T - the domain type, e.g. the type we are bucketizing
 ///   G - the number of bucket groups
@@ -42,7 +42,10 @@ pub fn Log2HdrHistogram(
         const word_size = std.meta.bitCount(T);
         const index_bits = std.math.log2(N);
         const index_mask = N - 1;
-        const IndexShift = std.meta.Int(.unsigned, std.math.log2(word_size));
+        const IndexShift = std.meta.Int(
+            .unsigned,
+            std.math.log2(nextPowerOfTwoComptime(word_size, 1)),
+        );
 
         count: usize = 0,
         sum: usize = 0,
@@ -263,4 +266,36 @@ test "DefaultLog2HdrHistogram" {
 
     try std.testing.expectEqual(@as(u63, 0), S.bucketValue(0));
     try std.testing.expectEqual(@as(u63, 40704), S.bucketValue(655));
+}
+
+// Small helper to find the next power-of-two above some minimum, but unlike
+// std.math.ceilPowerOfTwo, works on comptime_int so we can build an Int type
+// from the returned bit count.
+fn nextPowerOfTwoComptime(
+    comptime v: comptime_int,
+    comptime min: comptime_int,
+) comptime_int {
+    std.debug.assert(v > 0);
+    std.debug.assert(v <= 64);
+
+    var p: comptime_int = min;
+    inline while (p < v) p <<= 1;
+
+    return p;
+}
+
+test "nextPowerOfTwoComptime" {
+    // turn a u1 into a u8
+    try std.testing.expectEqual(8, nextPowerOfTwoComptime(1, 8));
+
+    // a u8 should just be a u8
+    try std.testing.expectEqual(8, nextPowerOfTwoComptime(8, 8));
+
+    // etc.
+    try std.testing.expectEqual(16, nextPowerOfTwoComptime(9, 8));
+    try std.testing.expectEqual(16, nextPowerOfTwoComptime(16, 8));
+    try std.testing.expectEqual(32, nextPowerOfTwoComptime(17, 8));
+    try std.testing.expectEqual(32, nextPowerOfTwoComptime(32, 8));
+    try std.testing.expectEqual(64, nextPowerOfTwoComptime(33, 8));
+    try std.testing.expectEqual(64, nextPowerOfTwoComptime(64, 8));
 }

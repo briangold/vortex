@@ -11,10 +11,21 @@ const Ordering = std.atomic.Ordering;
 const cache_line_bytes = std.atomic.cache_line;
 
 /// Returns the concrete type of the queue holding type T. This public API
-/// uses a u32 type for the queue's internal Index, safe for use in practice
-/// and compatible with Futex operations.
+/// uses a u32 type for the queue's internal Index, safe for use in practice.
+/// Blocking APIs will spin, so use push() and pop() with caution.
 pub fn ConcurrentArrayQueue(comptime T: type) type {
-    return ConcurrentArrayQueueImpl(T, u32, std.atomic.Atomic(u32));
+    return ConcurrentArrayQueueFutex(T, null);
+}
+
+/// Returns the concrete type of the queue holding type T. This public API
+/// uses a u32 type for the queue's internal Index, safe for use in practice.
+/// Blocking APIs will use the MaybeFutex type (if non-null) to wait efficiently
+/// for access.
+pub fn ConcurrentArrayQueueFutex(
+    comptime T: type,
+    comptime MaybeFutex: ?type,
+) type {
+    return ConcurrentArrayQueueImpl(T, u32, std.atomic.Atomic(u32), MaybeFutex);
 }
 
 /// The internal implementation, with narrower Index types, is useful for
@@ -25,6 +36,7 @@ fn ConcurrentArrayQueueImpl(
     comptime T: type,
     comptime I: type,
     comptime AtomicIndex: type,
+    comptime MaybeFutex: ?type,
 ) type {
     const index_info = @typeInfo(I).Int;
     comptime {
@@ -81,27 +93,39 @@ fn ConcurrentArrayQueueImpl(
 
         /// Push an element onto the queue, potentially blocking until space
         /// is available. Use with caution!
-        pub fn push(queue: *Queue, item: T) void {
+        pub fn push(queue: *Queue, item: T) !void {
             const head = queue.head.fetchAdd(1, .Monotonic);
             const slot = &queue.slots[queue.idx(head)];
-            while (2 *% queue.turn(head) != slot.turn.load(.Acquire)) {
-                // blocking
+            while (true) {
+                const turn_sample = slot.turn.load(.Acquire);
+                // if (MaybeFutex != null)
+                //     std.debug.print("push {*} sample={d} expect={d}\n", .{ &slot.turn, turn_sample, 2 *% queue.turn(head) });
+                if (turn_sample == 2 *% queue.turn(head)) break;
+                if (MaybeFutex) |Futex|
+                    try Futex.wait(&slot.turn, turn_sample, null);
             }
             slot.data = item;
             slot.turn.store(2 *% queue.turn(head) +% 1, .Release);
+            if (MaybeFutex) |Futex| Futex.wake(&slot.turn, std.math.maxInt(usize));
         }
 
         /// Pop an element from the queue, potentially blocking on an empty
         /// queue until a new element is available. Use with caution!
-        pub fn pop(queue: *Queue) T {
+        pub fn pop(queue: *Queue) !T {
             const tail = queue.tail.fetchAdd(1, .Monotonic);
             const slot = &queue.slots[queue.idx(tail)];
-            while (2 *% queue.turn(tail) +% 1 != slot.turn.load(.Acquire)) {
-                // blocking
+            while (true) {
+                const turn_sample = slot.turn.load(.Acquire);
+                // if (MaybeFutex != null)
+                //     std.debug.print("pop  {*} sample={d} expect={d}\n", .{ &slot.turn, turn_sample, 2 *% queue.turn(tail) +% 1 });
+                if (turn_sample == 2 *% queue.turn(tail) +% 1) break;
+                if (MaybeFutex) |Futex|
+                    try Futex.wait(&slot.turn, turn_sample, null);
             }
             const v = slot.data;
             slot.data = undefined;
             slot.turn.store(2 *% queue.turn(tail) +% 2, .Release);
+            if (MaybeFutex) |Futex| Futex.wake(&slot.turn, std.math.maxInt(usize));
             return v;
         }
 
@@ -168,11 +192,11 @@ fn ConcurrentArrayQueueImpl(
             return queue.size() == 0;
         }
 
-        fn idx(queue: *Queue, i: Index) Index {
+        inline fn idx(queue: *const Queue, i: Index) Index {
             return i & queue.mask;
         }
 
-        fn turn(queue: *Queue, i: Index) Index {
+        inline fn turn(queue: *const Queue, i: Index) Index {
             return i >> queue.shift;
         }
     };
@@ -224,7 +248,7 @@ test "queue" {
         }
     };
 
-    const Q = ConcurrentArrayQueueImpl(u8, I, MockAtomicIndex);
+    const Q = ConcurrentArrayQueueImpl(u8, I, MockAtomicIndex, null);
     try std.testing.expectError(error.BadQueueCapacity, Q.init(alloc, 0));
     try std.testing.expectError(error.BadQueueCapacity, Q.init(alloc, 3));
 
@@ -249,17 +273,17 @@ test "queue" {
     try std.testing.expectEqual(@as(?u8, null), q.try_pop());
     try std.testing.expectEqual(true, q.empty());
 
-    q.push(42);
+    try q.push(42);
     try std.testing.expectEqual(@as(u8, 1), q.size());
-    try std.testing.expectEqual(@as(u8, 42), q.pop());
+    try std.testing.expectEqual(@as(u8, 42), try q.pop());
     try std.testing.expectEqual(true, q.empty());
 
-    q.push(1);
-    q.push(2);
+    try q.push(1);
+    try q.push(2);
     try std.testing.expectEqual(@as(u8, 2), q.size());
-    try std.testing.expectEqual(@as(u8, 1), q.pop());
+    try std.testing.expectEqual(@as(u8, 1), try q.pop());
     try std.testing.expectEqual(@as(u8, 1), q.size());
-    try std.testing.expectEqual(@as(u8, 2), q.pop());
+    try std.testing.expectEqual(@as(u8, 2), try q.pop());
     try std.testing.expectEqual(true, q.empty());
 }
 
@@ -325,7 +349,7 @@ fn QueueTestConcurrent(comptime Queue: type) type {
 
             var j: usize = tid;
             while (j < num_ops) : (j += num_producers) {
-                q.push(j);
+                q.push(j) catch unreachable;
             }
         }
 
@@ -342,7 +366,7 @@ fn QueueTestConcurrent(comptime Queue: type) type {
             var thread_sum: u64 = 0;
             var j: usize = tid;
             while (j < num_ops) : (j += num_consumers) {
-                thread_sum += q.pop();
+                thread_sum += q.pop() catch unreachable;
             }
 
             _ = @atomicRmw(u64, sum, .Add, thread_sum, .SeqCst);
@@ -412,7 +436,7 @@ pub fn QueueCycleTest(comptime Queue: anytype) type {
                 // we will block this thread. Forward progress is guaranteed,
                 // as long as the OS eventually schedules the critical-section
                 // holder. See comment in try_push()
-                qct.queue.push(item);
+                qct.queue.push(item) catch unreachable;
             }
         }
     };
@@ -448,36 +472,4 @@ test "concurrent recycling" {
         var qt = QueueCycleTest(Queue){ .queue = &q };
         try qt.run(tc.num_threads, tc.num_ops);
     }
-}
-
-// Small helper to find the next power-of-two above some minimum, but unlike
-// std.math.ceilPowerOfTwo, works on comptime_int so we can build an Int type
-// from the returned bit count.
-fn nextPowerOfTwoComptime(
-    comptime v: comptime_int,
-    comptime min: comptime_int,
-) comptime_int {
-    assert(v > 0);
-    assert(v <= 64);
-
-    var p: comptime_int = min;
-    inline while (p < v) p <<= 1;
-
-    return p;
-}
-
-test "nextPowerOfTwoComptime" {
-    // turn a u1 into a u8
-    try std.testing.expectEqual(8, nextPowerOfTwoComptime(1, 8));
-
-    // a u8 should just be a u8
-    try std.testing.expectEqual(8, nextPowerOfTwoComptime(8, 8));
-
-    // etc.
-    try std.testing.expectEqual(16, nextPowerOfTwoComptime(9, 8));
-    try std.testing.expectEqual(16, nextPowerOfTwoComptime(16, 8));
-    try std.testing.expectEqual(32, nextPowerOfTwoComptime(17, 8));
-    try std.testing.expectEqual(32, nextPowerOfTwoComptime(32, 8));
-    try std.testing.expectEqual(64, nextPowerOfTwoComptime(33, 8));
-    try std.testing.expectEqual(64, nextPowerOfTwoComptime(64, 8));
 }

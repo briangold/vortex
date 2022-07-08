@@ -178,7 +178,7 @@ fn VortexImpl(comptime R: type) type {
 
             /// Channels to communicate values between tasks
             pub fn Channel(comptime T: type) type {
-                const Impl = @import("src/sync/channel.zig").Channel;
+                const Impl = @import("src/sync/array_queue.zig").ConcurrentArrayQueueFutex;
                 return Impl(T, Futex);
             }
 

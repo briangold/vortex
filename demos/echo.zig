@@ -151,15 +151,19 @@ const Client = struct {
             conn.tracker = .{};
 
             // spawn a new task for the connection
-            try vx.task.spawn(
+            vx.task.spawn(
                 &conn.task,
                 .{ client, &conn.tracker },
                 null,
-            );
+            ) catch |err| {
+                std.debug.panic("Unable to spawn task: {}", .{err});
+            };
         }
 
         for (connections) |*conn| {
-            try conn.task.join();
+            conn.task.join() catch |err| {
+                std.debug.panic("Error: {}", .{err});
+            };
 
             client.total_tracker.merge(&conn.tracker);
         }

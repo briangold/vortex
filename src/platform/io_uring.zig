@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 
 const IoUring = std.os.linux.IO_Uring;
 const CompletionEvent = std.os.linux.io_uring_cqe;
+const SubmissionEntry = std.os.linux.io_uring_sqe;
 
 const Timespec = @import("../clock.zig").Timespec;
 const CancelToken = @import("../scheduler.zig").CancelToken;
@@ -20,8 +21,8 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
     return struct {
         pub const Config = struct {
             /// Desired number of submission-queue entries. Must be a power-of-2
-            /// between 1 and 4096.
-            num_entries: u13 = 4096,
+            /// between 1 and 4096. TODO: enforce real lower limit of 4 due to reserve ops
+            num_entries: u13 = 1024,
 
             /// Limit on how many completions can be reaped in a single call
             /// to poll().
@@ -94,14 +95,15 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
                 .tv_nsec = @intCast(isize, timeout_ns),
             };
 
-            _ = platform.io_uring.timeout(
-                internal_timeout_userdata,
+            // submit our internal timeout that limits poll duration
+            var sqe = platform.getSQEntry();
+            std.os.linux.io_uring_prep_timeout(
+                sqe,
                 &timeout_spec,
-                1, // count => don't set res to -ETIME if we get a completion
+                1, // count => don't set res to -ETIME if we get completion
                 0, // relative timeout
-            ) catch |err| {
-                std.debug.panic("Unable to submit internal timeout: {}\n", .{err});
-            };
+            );
+            sqe.user_data = internal_timeout_userdata;
 
             // submit all pending sqes and wait for one (worst case, our timeout)
             _ = platform.io_uring.submit_and_wait(1) catch |err| {
@@ -154,21 +156,23 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
 
             var to_cancel = platform.cancelq.unlink();
             while (to_cancel.get()) |op| : (_ = to_cancel.next()) {
+                // Queue the cancellation as a SQE, which will be processed by
+                // the poll() loop like any other
+                var cancel_sqe = platform.getSQEntry();
+
                 switch (op.args) {
-                    // cancellable operations
+                    // timeout-based operations
                     .sleep,
                     .futex_wait,
                     => {
-                        // this queues the cancellation as a SQE, which will be
-                        // processed by the poll() loop like any other
-                        _ = platform.io_uring.timeout_remove(
-                            internal_cancel_userdata,
+                        std.os.linux.io_uring_prep_timeout_remove(
+                            cancel_sqe,
                             @ptrToInt(op),
                             0,
-                        ) catch |err| {
-                            std.debug.panic("timeout_remove failed: {s}", .{err});
-                        };
+                        );
                     },
+
+                    // I/O based operations
                     .accept,
                     .connect,
                     .recv,
@@ -176,17 +180,17 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
                     .read,
                     .write,
                     => {
-                        // this queues the cancellation as a SQE, which will be
-                        // processed by the poll() loop like any other
-                        _ = platform.io_uring.cancel(
-                            internal_cancel_userdata,
+                        std.os.linux.io_uring_prep_cancel(
+                            cancel_sqe,
                             @ptrToInt(op),
                             0,
-                        ) catch |err| {
-                            std.debug.panic("cancellation failed: {s}", .{err});
-                        };
+                        );
                     },
                 }
+
+                // We get the useful CQE back from the original submission,
+                // and can safely ignore the cancellation CQE in poll()
+                cancel_sqe.user_data = internal_cancel_userdata;
             }
 
             return user_events;
@@ -194,6 +198,27 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
 
         pub fn hasPending(platform: *Platform) bool {
             return platform.pending != 0;
+        }
+
+        fn getSQEntry(
+            platform: *Platform,
+        ) *SubmissionEntry {
+            if (platform.io_uring.get_sqe()) |sqe| {
+                return sqe;
+            } else |err| {
+                assert(err == error.SubmissionQueueFull);
+
+                // submit, but don't wait for any completions
+                _ = platform.io_uring.submit() catch |err2|
+                    std.debug.panic("io_uring enter() failed: {}", .{err2});
+
+                // try again
+                if (platform.io_uring.get_sqe()) |sqe| {
+                    return sqe;
+                } else |err2| {
+                    std.debug.panic("io_uring get_sqe() failed: {}", .{err2});
+                }
+            }
         }
 
         fn emitEvent(
@@ -519,21 +544,25 @@ fn IoOperationImpl(comptime Platform: type) type {
 
             switch (op.args) {
                 .sleep => {
-                    _ = try op.platform.io_uring.timeout(
-                        @ptrToInt(op),
+                    var sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_timeout(
+                        sqe,
                         &op.timeout,
                         0, // count => wait independent of other events
                         0, // relative timeout
                     );
+                    sqe.user_data = @ptrToInt(op);
                 },
 
                 .futex_wait => |*args| {
-                    _ = try op.platform.io_uring.timeout(
-                        @ptrToInt(op),
+                    var sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_timeout(
+                        sqe,
                         &op.timeout,
                         0, // count => wait independent of other events
                         0, // relative timeout
                     );
+                    sqe.user_data = @ptrToInt(op);
 
                     // state transition loop - atomically transition:
                     //   empty    => waiting  :: the waker will see waiting
@@ -567,106 +596,124 @@ fn IoOperationImpl(comptime Platform: type) type {
                 },
 
                 .accept => |*args| {
-                    var sqe = try op.platform.io_uring.accept(
-                        @ptrToInt(op),
+                    var sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_accept(
+                        sqe,
                         args.listen_fd,
                         args.addr,
                         args.addrlen,
                         args.flags,
                     );
-
+                    sqe.user_data = @ptrToInt(op);
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.platform.io_uring.link_timeout(
-                        internal_link_timeout_userdata,
+                    sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_link_timeout(
+                        sqe,
                         &op.timeout,
                         0, // relative timeout
                     );
+                    sqe.user_data = internal_link_timeout_userdata;
                 },
 
                 .connect => |*args| {
-                    var sqe = try op.platform.io_uring.connect(
-                        @ptrToInt(op),
+                    var sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_connect(
+                        sqe,
                         args.fd,
                         args.addr,
                         args.addrlen,
                     );
-
+                    sqe.user_data = @ptrToInt(op);
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.platform.io_uring.link_timeout(
-                        internal_link_timeout_userdata,
+                    sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_link_timeout(
+                        sqe,
                         &op.timeout,
                         0, // relative timeout
                     );
+                    sqe.user_data = internal_link_timeout_userdata;
                 },
 
                 .recv => |*args| {
-                    var sqe = try op.platform.io_uring.recv(
-                        @ptrToInt(op),
+                    var sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_recv(
+                        sqe,
                         args.fd,
-                        .{ .buffer = args.buffer },
+                        args.buffer,
                         args.flags,
                     );
-
+                    sqe.user_data = @ptrToInt(op);
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.platform.io_uring.link_timeout(
-                        internal_link_timeout_userdata,
+                    sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_link_timeout(
+                        sqe,
                         &op.timeout,
                         0, // relative timeout
                     );
+                    sqe.user_data = internal_link_timeout_userdata;
                 },
 
                 .send => |*args| {
-                    var sqe = try op.platform.io_uring.send(
-                        @ptrToInt(op),
+                    var sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_send(
+                        sqe,
                         args.fd,
                         args.buffer,
                         args.flags,
                     );
-
+                    sqe.user_data = @ptrToInt(op);
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.platform.io_uring.link_timeout(
-                        internal_link_timeout_userdata,
+                    sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_link_timeout(
+                        sqe,
                         &op.timeout,
                         0, // relative timeout
                     );
+                    sqe.user_data = internal_link_timeout_userdata;
                 },
 
                 .read => |*args| {
-                    var sqe = try op.platform.io_uring.read(
-                        @ptrToInt(op),
-                        args.fd,
-                        .{ .buffer = args.buffer },
-                        args.offset,
-                    );
-
-                    sqe.flags |= std.os.linux.IOSQE_IO_LINK;
-
-                    _ = try op.platform.io_uring.link_timeout(
-                        internal_link_timeout_userdata,
-                        &op.timeout,
-                        0, // relative timeout
-                    );
-                },
-
-                .write => |*args| {
-                    var sqe = try op.platform.io_uring.write(
-                        @ptrToInt(op),
+                    var sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_read(
+                        sqe,
                         args.fd,
                         args.buffer,
                         args.offset,
                     );
-
+                    sqe.user_data = @ptrToInt(op);
                     sqe.flags |= std.os.linux.IOSQE_IO_LINK;
 
-                    _ = try op.platform.io_uring.link_timeout(
-                        internal_link_timeout_userdata,
+                    sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_link_timeout(
+                        sqe,
                         &op.timeout,
                         0, // relative timeout
                     );
+                    sqe.user_data = internal_link_timeout_userdata;
+                },
+
+                .write => |*args| {
+                    var sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_write(
+                        sqe,
+                        args.fd,
+                        args.buffer,
+                        args.offset,
+                    );
+                    sqe.user_data = @ptrToInt(op);
+                    sqe.flags |= std.os.linux.IOSQE_IO_LINK;
+
+                    sqe = op.platform.getSQEntry();
+                    std.os.linux.io_uring_prep_link_timeout(
+                        sqe,
+                        &op.timeout,
+                        0, // relative timeout
+                    );
+                    sqe.user_data = internal_link_timeout_userdata;
                 },
             }
         }

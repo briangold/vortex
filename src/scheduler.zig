@@ -4,7 +4,7 @@ const assert = std.debug.assert;
 const Atomic = std.atomic.Atomic;
 
 const FwdIndexedList = @import("list.zig").FwdIndexedList;
-const ConcurrentArrayQueue = @import("array_queue.zig").ConcurrentArrayQueue;
+const ConcurrentArrayQueue = @import("sync/array_queue.zig").ConcurrentArrayQueue;
 
 const clock = @import("clock.zig");
 const Timespec = clock.Timespec;
@@ -136,7 +136,7 @@ fn SchedulerImpl(comptime C: type) type {
 
             var idx: Task.Index = 0;
             while (idx < config.max_tasks) : (idx += 1) {
-                self.free.push(idx);
+                self.free.push(idx) catch unreachable;
                 self.taskTree[idx] = TaskTreeNode{
                     .children = SiblingList.init(self.tasks),
                     .mutex = std.Thread.Mutex{},
@@ -304,7 +304,7 @@ fn SchedulerImpl(comptime C: type) type {
             // We are guaranteed to succeed with getting a tid, so we use the
             // blocking pop() here. See the comments in the queue implementation
             // for scenarios where blocking can occur. It should be rare.
-            const tid = self.free.pop();
+            const tid = self.free.pop() catch unreachable;
 
             var task = &self.tasks[tid];
             task.* = Task{
@@ -341,7 +341,9 @@ fn SchedulerImpl(comptime C: type) type {
 
             // ok to run this read only operation outside mutex b/c tid no
             // longer running, and cannot spawn concurrently
-            assert(self.taskTree[tid].children.peek() == null); // cannot have children
+            if (self.taskTree[tid].children.peek() != null) {
+                std.debug.panic("Task {} did not join child tasks before finishing", .{tid});
+            }
 
             if (task.parent) |parent| {
                 // remove this task from its parents' list of children
@@ -353,7 +355,7 @@ fn SchedulerImpl(comptime C: type) type {
             }
 
             task.state = .empty;
-            self.free.push(tid);
+            self.free.push(tid) catch unreachable;
 
             // Admission control
             if (self.admit.dec() == null)
@@ -367,7 +369,7 @@ fn SchedulerImpl(comptime C: type) type {
 
             task.state = .runnable;
             task.frame = frame;
-            self.runqueue.push(tid);
+            self.runqueue.push(tid) catch unreachable;
         }
 
         /// Finishes a task
@@ -467,7 +469,7 @@ fn SchedulerImpl(comptime C: type) type {
             self.emitEvent(TaskRescheduledEvent, .{ .task = task });
 
             task.state = .runnable;
-            self.runqueue.push(tid);
+            self.runqueue.push(tid) catch unreachable;
         }
 
         /// Cancels task `tid'. If suspended for I/O operation, calls into
