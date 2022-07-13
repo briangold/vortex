@@ -1,13 +1,14 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const ztracy = @import("ztracy");
+
 const IoUring = std.os.linux.IO_Uring;
 const CompletionEvent = std.os.linux.io_uring_cqe;
 const SubmissionEntry = std.os.linux.io_uring_sqe;
 
 const Timespec = @import("../clock.zig").Timespec;
 const CancelToken = @import("../scheduler.zig").CancelToken;
-const Emitter = @import("../event.zig").Emitter;
 const EventRegistry = @import("../event.zig").EventRegistry;
 const CancelQueue = @import("cancel_queue.zig").CancelQueue;
 const max_time = @import("../clock.zig").max_time;
@@ -18,6 +19,8 @@ const internal_cancel_userdata = std.math.maxInt(usize) - 1;
 const internal_link_timeout_userdata = std.math.maxInt(usize) - 2;
 
 pub fn IoUringPlatform(comptime Scheduler: type) type {
+    const Emitter = @import("../event.zig").Emitter(Scheduler.Clock);
+
     return struct {
         pub const Config = struct {
             /// Desired number of submission-queue entries. Must be a power-of-2
@@ -56,7 +59,8 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
             // If we want to support additional flags, we should expose them
             // as discrete config options/enum choices, then convert to the
             // bitfield flags here. For now the defaults are fine.
-            const io_uring_flags: u32 = 0;
+            // FIXME: experimenting with SQPOLL
+            const io_uring_flags: u32 = std.os.linux.IORING_SETUP_SQPOLL;
 
             return Platform{
                 .clock = sched.clock,
@@ -105,14 +109,20 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
             );
             sqe.user_data = internal_timeout_userdata;
 
-            // submit all pending sqes and wait for one (worst case, our timeout)
-            _ = platform.io_uring.submit_and_wait(1) catch |err| {
+            // submit all pending sqes
+            const submitted = platform.io_uring.submit() catch |err| {
                 std.debug.panic("Unable to submit_and_wait: {}\n", .{err});
             };
 
-            const completed = platform.io_uring.copy_cqes(platform.events, 0) catch |err| {
+            ztracy.PlotU("sqes", submitted);
+
+            // copy completions, and if none available, wait for at least
+            // one (our timeout) to arrive
+            const completed = platform.io_uring.copy_cqes(platform.events, 1) catch |err| {
                 std.debug.panic("Unable to copy_cqes: {}\n", .{err});
             };
+
+            ztracy.PlotU("cqes_post", completed);
 
             var user_events: usize = 0;
             var i: usize = 0;
@@ -155,7 +165,10 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
             }
 
             var to_cancel = platform.cancelq.unlink();
+            var needs_flush = (to_cancel.get() != null);
             while (to_cancel.get()) |op| : (_ = to_cancel.next()) {
+                needs_flush = true;
+
                 // Queue the cancellation as a SQE, which will be processed by
                 // the poll() loop like any other
                 var cancel_sqe = platform.getSQEntry();
@@ -193,6 +206,10 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
                 cancel_sqe.user_data = internal_cancel_userdata;
             }
 
+            // flush cancellations
+            if (needs_flush) _ = platform.io_uring.submit() catch |err|
+                std.debug.panic("io_uring cancellation submit failed: {}", .{err});
+
             return user_events;
         }
 
@@ -226,7 +243,7 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
             comptime Event: type,
             user: Event.User,
         ) void {
-            platform.emitter.emit(platform.clock.now(), threadId(), Event, user);
+            platform.emitter.emit(platform.clock, threadId(), Event, user);
         }
 
         const posix = @import("posix_sockets.zig");
@@ -721,9 +738,12 @@ fn IoOperationImpl(comptime Platform: type) type {
         pub fn complete(op: *IoOperation) !usize {
             switch (op.args) {
                 .sleep => {
-                    const ETIME = -@as(i32, @enumToInt(std.os.linux.E.TIME));
-                    assert(op.completion.result == ETIME);
-                    return @as(usize, 0);
+                    if (op.completion.result < 0) {
+                        return switch (@intToEnum(std.os.E, -op.completion.result)) {
+                            .TIME => @as(usize, 0),
+                            else => |err| std.debug.panic("Unexpected error: {}", .{err}),
+                        };
+                    } else unreachable;
                 },
 
                 .futex_wait => {

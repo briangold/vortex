@@ -2,8 +2,9 @@ const std = @import("std");
 const target = @import("builtin").target;
 const assert = std.debug.assert;
 
+const ztracy = @import("ztracy");
+
 const Timespec = @import("../clock.zig").Timespec;
-const Emitter = @import("../event.zig").Emitter;
 const EventRegistry = @import("../event.zig").EventRegistry;
 const CancelToken = @import("../scheduler.zig").CancelToken;
 const FwdIndexedList = @import("../list.zig").FwdIndexedList;
@@ -22,6 +23,8 @@ const Poller = switch (target.os.tag) {
 const Index = u32; // indexes events in internal lists
 
 pub fn ReactorPlatform(comptime Scheduler: type) type {
+    const Emitter = @import("../event.zig").Emitter(Scheduler.Clock);
+
     const Entry = struct {
         next: ?Index = null, // primary linkage (free list, per-fd, etc.)
         next_to: ?Index = null, // used by timewheel ordering
@@ -41,7 +44,7 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
         pub const Config = struct {
             /// Maximum outstanding I/O requests that can be submitted. Must be
             /// a power-of-2 (enforced at startup).
-            max_events: Index = 128,
+            max_events: Index = 32768,
 
             /// Limit on how many requests can be polled at once. Must be less
             /// than or equal to max_events (enforced at startup).
@@ -50,7 +53,7 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
             /// How many slots (hash buckets) in the timewheel. More slots mean
             /// generally shorter searches when identifying timeouts, but also
             /// more memory required. Must be power-of-2 (enforced at startup).
-            timewheel_slots: usize = 128,
+            timewheel_slots: usize = 1024,
 
             /// Resolution (nanoseconds) of each timewheel slot. Finer
             /// resolution (smaller values) mean more slots get used for
@@ -60,11 +63,11 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
             /// more slots mean more places to look, and because entries in a
             /// slot are unsorted, we may encounter more entries from future
             /// times that slow down the search.
-            timewheel_resolution: usize = 1024,
+            timewheel_resolution: usize = 1024 * 1024,
 
             /// Max open file descriptors. Must be power-of-2 (enforced at
             /// startup).
-            max_fd: usize = 1024,
+            max_fd: usize = 32768,
         };
 
         pub const Descriptor = OsDescriptor;
@@ -166,30 +169,9 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
         /// Waits up to `timeout' nanoseconds for a completion. Returns the
         /// number of completions handled.
         pub fn poll(platform: *Platform, timeout_ns: Timespec) !usize {
-            var count: usize = 0;
-
-            // Process expired timeouts
-            const now = platform.clock.now();
-            defer platform.prevTime = now; // set up for next call to enter()
-
-            var expired = platform.timers.expireTimeouts(.{ platform.prevTime, now });
-            while (expired.pop()) |idx| {
-                const entry = &platform.entries[idx];
-
-                // remove the expired entry from FDT list and wake callback
-                const op = entry.getOp(IoOperation);
-                if (op.descriptor()) |fd| {
-                    _ = platform.fdt.cancelEntry(
-                        idx,
-                        fd,
-                    ) orelse @panic("No fdt entry to expire");
-                }
-
-                count += platform.wakeupEntry(idx, .timeout);
-            }
-
             // Process pending cancellations, if any
             var to_cancel = platform.cancelq.unlink();
+            var cancel_count: usize = 0;
             while (to_cancel.get()) |op| : (_ = to_cancel.next()) {
                 if (op.descriptor()) |fd| {
                     platform.emitEvent(IoCancelEvent, .{ .op = op });
@@ -205,30 +187,60 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
                     _ = removed;
 
                     // wakeup the handler and free the entry
-                    count += platform.wakeupEntry(op.idx, .canceled);
+                    cancel_count += platform.wakeupEntry(op.idx, .canceled);
                 }
             }
+            ztracy.PlotU("cancel_wakeups", cancel_count);
 
-            // if we haven't processed any ops to this point, poll
-            if (count == 0) {
-                var nevents = try platform.poller.poll(platform.events, timeout_ns);
+            // Examine timeouts -- if we have any to process, then don't wait
+            // in I/O poll operation. We don't process the timeouts yet, though,
+            // to avoid tasks that sleep(0) from hogging the scheduler loop.
+            const now = platform.clock.now();
+            defer platform.prevTime = now; // set up for next call to enter()
+            var expired = platform.timers.expireTimeouts(.{ platform.prevTime, now });
+            const poll_timeout = if (cancel_count == 0 and expired.peek() == null)
+                timeout_ns
+            else
+                0;
 
-                for (platform.events[0..nevents]) |*ev| {
-                    const fd = ev.descriptor();
-                    const kind = ev.readiness();
+            // Poll for I/O
+            var poll_count: usize = 0;
+            var nevents = try platform.poller.poll(platform.events, poll_timeout);
 
-                    var ops = platform.fdt.getEntries(fd, kind);
+            for (platform.events[0..nevents]) |*ev| {
+                const fd = ev.descriptor();
+                const kind = ev.readiness();
 
-                    while (ops.pop()) |idx| {
-                        // remove the timeout that was set for this entry and
-                        // wake callback
-                        _ = platform.timers.unregTimeout(idx);
-                        count += platform.wakeupEntry(idx, .success);
-                    }
+                var ops = platform.fdt.getEntries(fd, kind);
+
+                while (ops.pop()) |idx| {
+                    // remove the timeout that was set for this entry and
+                    // wake callback
+                    _ = platform.timers.unregTimeout(idx);
+                    poll_count += platform.wakeupEntry(idx, .success);
                 }
             }
+            ztracy.PlotU("poll_wakeups", poll_count);
 
-            return count;
+            // Process expired timeouts
+            var timeout_count: usize = 0;
+            while (expired.pop()) |idx| {
+                const entry = &platform.entries[idx];
+
+                // remove the expired entry from FDT list and wake callback
+                const op = entry.getOp(IoOperation);
+                if (op.descriptor()) |fd| {
+                    _ = platform.fdt.cancelEntry(
+                        idx,
+                        fd,
+                    ) orelse @panic("No fdt entry to expire");
+                }
+
+                timeout_count += platform.wakeupEntry(idx, .timeout);
+            }
+            ztracy.PlotU("timeout_wakeups", timeout_count);
+
+            return cancel_count + poll_count + timeout_count;
         }
 
         fn wakeupEntry(platform: *Platform, idx: Index, status: IoStatus) usize {
@@ -260,7 +272,7 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
             comptime Event: type,
             user: Event.User,
         ) void {
-            platform.emitter.emit(platform.clock.now(), threadId(), Event, user);
+            platform.emitter.emit(platform.clock, threadId(), Event, user);
         }
 
         const posix = @import("posix_sockets.zig");

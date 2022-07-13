@@ -4,7 +4,6 @@ const Atomic = std.atomic.Atomic;
 
 const platform = @import("platform.zig");
 const scheduler = @import("scheduler.zig");
-const Emitter = @import("event.zig").Emitter;
 const EventRegistry = @import("event.zig").EventRegistry;
 const SignalJunction = @import("signal.zig").SignalJunction;
 
@@ -27,6 +26,7 @@ pub fn RuntimeImpl(comptime P: type) type {
         pub const Scheduler = Platform.Scheduler;
         pub const Clock = Scheduler.Clock;
         pub const Config = @import("config.zig").Config(Runtime);
+        pub const Emitter = @import("event.zig").Emitter(Clock);
 
         emitter: *Emitter,
         clock: *Clock,
@@ -174,7 +174,7 @@ pub fn RuntimeImpl(comptime P: type) type {
                 // setup TLS
                 thread_id = id;
 
-                rt.emitter.emit(rt.clock.now(), id, ThreadStartEvent, .{});
+                rt.emitter.emit(rt.clock, id, ThreadStartEvent, .{});
 
                 // The core loop
                 while (!done.load(.Monotonic)) {
@@ -201,7 +201,7 @@ pub fn RuntimeImpl(comptime P: type) type {
                 // Invariant checks
                 assert(!self.loop.hasPending()); // no pending I/O operations
 
-                rt.emitter.emit(rt.clock.now(), id, ThreadEndEvent, .{});
+                rt.emitter.emit(rt.clock, id, ThreadEndEvent, .{});
             }
         };
     };

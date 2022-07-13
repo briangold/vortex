@@ -2,7 +2,7 @@
 //! observability means.
 const std = @import("std");
 const assert = std.debug.assert;
-const Level = std.log.Level;
+pub const Level = std.log.Level;
 
 const ztracy = @import("ztracy");
 
@@ -17,73 +17,75 @@ pub const SyncEventWriter = struct {
 
 // The Emitter that will be used by various threads to emit registered events
 // of interest.
-pub const Emitter = struct {
-    const Self = @This();
+pub fn Emitter(comptime Clock: type) type {
+    return struct {
+        const Self = @This();
 
-    log_level: Level,
-    sync_writer: SyncEventWriter,
-
-    pub fn init(
         log_level: Level,
         sync_writer: SyncEventWriter,
-    ) Self {
-        return Self{
-            .log_level = log_level,
-            .sync_writer = sync_writer,
-        };
-    }
 
-    pub fn emit(
-        self: *Self,
-        now: Timespec,
-        tid: usize,
-        comptime Event: type,
-        user: Event.User,
-    ) void {
-        // bail if this is at a higher verbosity
-        if (@enumToInt(Event.level) > @enumToInt(self.log_level)) return;
-
-        const ev = Event.init(now, user);
-
-        var buf: [4096]u8 = undefined;
-        var bw = std.io.fixedBufferStream(&buf);
-
-        bw.writer().print("{d:>15} [{d:0>3}] {s:<9} {s:12} {s:16} ", .{
-            ev.timestamp,
-            tid,
-            "(" ++ Event.level.asText() ++ ")",
-            Event.namespace,
-            @tagName(Event.code),
-        }) catch @panic("Unable to write event");
-
-        if (std.meta.fields(Event.User).len > 0) {
-            bw.writer().writeAll("- ") catch @panic("Unable to write event");
+        pub fn init(
+            log_level: Level,
+            sync_writer: SyncEventWriter,
+        ) Self {
+            return Self{
+                .log_level = log_level,
+                .sync_writer = sync_writer,
+            };
         }
 
-        inline for (std.meta.fields(Event.User)) |f| {
-            bw.writer().print("{s}={any} ", .{
-                f.name,
-                @field(user, f.name),
+        pub fn emit(
+            self: *Self,
+            clock: *Clock,
+            tid: usize,
+            comptime Event: type,
+            user: Event.User,
+        ) void {
+            // bail if this is at a higher verbosity
+            if (@enumToInt(Event.level) > @enumToInt(self.log_level)) return;
+
+            const ev = Event.init(clock.now(), user);
+
+            var buf: [4096]u8 = undefined;
+            var bw = std.io.fixedBufferStream(&buf);
+
+            bw.writer().print("{d:>15} [{d:0>3}] {s:<9} {s:12} {s:16} ", .{
+                ev.timestamp,
+                tid,
+                "(" ++ Event.level.asText() ++ ")",
+                Event.namespace,
+                @tagName(Event.code),
             }) catch @panic("Unable to write event");
+
+            if (std.meta.fields(Event.User).len > 0) {
+                bw.writer().writeAll("- ") catch @panic("Unable to write event");
+            }
+
+            inline for (std.meta.fields(Event.User)) |f| {
+                bw.writer().print("{s}={any} ", .{
+                    f.name,
+                    @field(user, f.name),
+                }) catch @panic("Unable to write event");
+            }
+
+            bw.writer().writeAll("\n") catch @panic("Unable to write event");
+
+            // Emit to tracy - a nop unless built with -Denable-tracy=true
+            ztracy.Message(bw.getWritten());
+
+            // Emit into sync_writer stream
+            {
+                self.sync_writer.mutex.lock();
+                defer self.sync_writer.mutex.unlock();
+
+                self.sync_writer.writer.writeAll(bw.getWritten()) catch
+                    @panic("Unable to write to event stream");
+            }
         }
+    };
+}
 
-        bw.writer().writeAll("\n") catch @panic("Unable to write event");
-
-        // Emit to tracy - a nop unless built with -Denable-tracy=true
-        ztracy.Message(bw.getWritten());
-
-        // Emit into sync_writer stream
-        {
-            self.sync_writer.mutex.lock();
-            defer self.sync_writer.mutex.unlock();
-
-            self.sync_writer.writer.writeAll(bw.getWritten()) catch
-                @panic("Unable to write to event stream");
-        }
-    }
-};
-
-/// Returns a namespace-scoped registry of events. Each event has a 
+/// Returns a namespace-scoped registry of events. Each event has a
 /// corresponding code in the `Tag' enum, which must be registered via the
 /// register() method.
 pub fn EventRegistry(comptime namespace: []const u8, comptime Tag: type) type {
@@ -123,6 +125,7 @@ pub fn EventRegistry(comptime namespace: []const u8, comptime Tag: type) type {
 
 test "event registry" {
     const alloc = std.testing.allocator;
+    const SimClock = @import("clock.zig").SimClock;
 
     const MyScopedRegistry = EventRegistry("my.namespace", enum {
         foo,
@@ -149,8 +152,11 @@ test "event registry" {
         .mutex = &tmp_mutex,
     };
 
-    var e = Emitter.init(.info, sync_writer);
-    e.emit(1000, 0, FooEvent, .{ .value1 = 42 });
+    var clk = SimClock{};
+    clk.setTime(1000);
+
+    var e = Emitter(SimClock).init(.info, sync_writer);
+    e.emit(&clk, 0, FooEvent, .{ .value1 = 42 });
 
     const expect = "           1000 [000] (info)    my.namespace              foo - value1=42 \n";
 

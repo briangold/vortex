@@ -22,7 +22,7 @@ pub const SimPlatform = @import("platform/io_sim.zig").SimPlatform;
 fn test_sleep(comptime Platform: type) !void {
     const Scheduler = Platform.Scheduler;
     const Clock = Scheduler.Clock;
-    const Emitter = @import("event.zig").Emitter;
+    const Emitter = @import("event.zig").Emitter(Clock);
     const SyncEventWriter = @import("event.zig").SyncEventWriter;
 
     const InitTask = struct {

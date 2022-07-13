@@ -4,11 +4,10 @@ const assert = std.debug.assert;
 const Atomic = std.atomic.Atomic;
 
 const FwdIndexedList = @import("list.zig").FwdIndexedList;
-const ConcurrentArrayQueue = @import("sync/array_queue.zig").ConcurrentArrayQueue;
+const ConcurrentArrayQueue = @import("sync/raw_array_queue.zig").ConcurrentArrayQueue;
 
 const clock = @import("clock.zig");
 const Timespec = clock.Timespec;
-const Emitter = @import("event.zig").Emitter;
 const EventRegistry = @import("event.zig").EventRegistry;
 const threadId = @import("runtime.zig").threadId;
 
@@ -22,8 +21,10 @@ const ztracy = @import("ztracy");
 
 pub const Config = struct {
     /// Maximum number of spawned tasks, including the init task. Must be a
-    /// power-of-2.
-    max_tasks: Task.Index = 1024,
+    /// power-of-2. The scheduler will allocate a Task array and associated
+    /// structures at startup, so the value chosen here will affect memory
+    /// even if fewer tasks are spawned.
+    max_tasks: Task.Index = 32768,
 };
 
 pub const DefaultScheduler = SchedulerImpl(clock.DefaultClock);
@@ -94,6 +95,7 @@ fn SchedulerImpl(comptime C: type) type {
         const TaskList = FwdIndexedList(Task, .next);
         const SiblingList = FwdIndexedList(Task, .sibling);
         const TaskQueue = ConcurrentArrayQueue(TaskId);
+        const Emitter = @import("event.zig").Emitter(Clock);
 
         const TaskTreeNode = struct {
             children: SiblingList,
@@ -159,6 +161,7 @@ fn SchedulerImpl(comptime C: type) type {
         /// tasks.
         pub fn tick(self: *Scheduler) usize {
             var count: usize = 0;
+            const per_tick_limit = 20; // TODO: move to config
 
             while (self.runqueue.try_pop()) |tid| : (count += 1) {
                 // Mark the start of a task fragment.
@@ -199,6 +202,8 @@ fn SchedulerImpl(comptime C: type) type {
                     .tid = tid,
                     .delta = end - start,
                 });
+
+                if (count > per_tick_limit) break;
             }
 
             return count;
@@ -751,7 +756,7 @@ fn SchedulerImpl(comptime C: type) type {
             comptime Event: type,
             user: Event.User,
         ) void {
-            self.emitter.emit(self.clock.now(), threadId(), Event, user);
+            self.emitter.emit(self.clock, threadId(), Event, user);
         }
 
         /// Waits for one of several tasks to complete, and cancels all
@@ -1049,7 +1054,7 @@ test "Scheduler unit" {
         .mutex = std.debug.getStderrMutex(),
     };
 
-    var emitter = Emitter.init(.info, sync_writer);
+    var emitter = Scheduler.Emitter.init(.info, sync_writer);
 
     var sched = try Scheduler.init(alloc, &clk, &emitter, .{ .max_tasks = 2 });
     defer sched.deinit(alloc);
