@@ -178,7 +178,7 @@ fn VortexImpl(comptime R: type) type {
 
             /// Channels to communicate values between tasks
             pub fn Channel(comptime T: type) type {
-                const Impl = @import("src/sync/array_queue.zig").ConcurrentArrayQueueFutex;
+                const Impl = @import("src/sync/array_queue.zig").ArrayQueue;
                 return Impl(T, Futex);
             }
 
@@ -227,11 +227,16 @@ fn VortexImpl(comptime R: type) type {
             /// Emit an Event object with user-defined payload
             pub fn emit(comptime Event: type, user: Event.User) void {
                 _instance.emitter.emit(
-                    _instance.clock.now(),
+                    _instance.clock,
                     runtime.threadId(),
                     Event,
                     user,
                 );
+            }
+
+            /// Change the reporting level dynamically
+            pub fn setLevel(level: std.log.Level) void {
+                _instance.emitter.log_level = level;
             }
 
             /// Construct a scoped registry with the given namespace and enum of
