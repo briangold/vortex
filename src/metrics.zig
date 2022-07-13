@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const Timespec = @import("clock.zig").Timespec;
-
 pub fn DefaultLog2HdrHistogram(comptime T: type) type {
     // Uses the same defaults as FIO - 64 buckets per group, 29 groups
     return Log2HdrHistogram(T, 29, 64);
