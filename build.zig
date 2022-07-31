@@ -7,6 +7,7 @@ const FileSource = std.build.FileSource;
 
 pub const VxBuildOptions = struct {
     enable_tracy: bool = false,
+    force_reactor: bool = false,
 };
 
 pub fn addVortexPackage(
@@ -16,11 +17,12 @@ pub fn addVortexPackage(
     const b = libexe.builder;
     const exe_options = b.addOptions();
     exe_options.addOption(bool, "enable_tracy", options.enable_tracy);
+    exe_options.addOption(bool, "force_reactor", options.force_reactor);
 
     const options_pkg = exe_options.getPackage("build_options");
     const tracy_pkg = ztracy.getPkg(b, options_pkg);
 
-    libexe.addPackage(getVortexPkg(&[_]std.build.Pkg{tracy_pkg}));
+    libexe.addPackage(getVortexPkg(&[_]std.build.Pkg{ tracy_pkg, options_pkg }));
     libexe.linkLibC();
 
     ztracy.link(libexe, options.enable_tracy, .{ .fibers = true });
@@ -52,6 +54,7 @@ fn addDemo(
 
     addVortexPackage(exe, .{
         .enable_tracy = options.enable_tracy,
+        .force_reactor = options.force_reactor,
     });
 
     exe.setTarget(options.target);
@@ -114,6 +117,7 @@ pub fn build(b: *Builder) !void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
     const enable_tracy = b.option(bool, "enable-tracy", "Enable Tracy profiler") orelse false;
+    const force_reactor = b.option(bool, "force-reactor", "Use readiness (epoll) even when completion API (io_uring) available") orelse false;
 
     const demos = [_]struct {
         name: []const u8,
@@ -128,6 +132,7 @@ pub fn build(b: *Builder) !void {
             .target = target,
             .mode = mode,
             .enable_tracy = enable_tracy,
+            .force_reactor = force_reactor,
         });
     }
 
@@ -158,9 +163,12 @@ pub fn build(b: *Builder) !void {
 
     const test_opt = b.addOptions();
     test_opt.addOption(bool, "enable_tracy", false);
+    test_opt.addOption(bool, "force_reactor", force_reactor);
+    const options_pkg = test_opt.getPackage("build_options");
 
-    const ztracy_pkg = ztracy.getPkg(b, test_opt.getPackage("build_options"));
+    const ztracy_pkg = ztracy.getPkg(b, options_pkg);
     main_tests.addPackage(ztracy_pkg);
+    main_tests.addPackage(options_pkg);
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&main_tests.step);

@@ -1,11 +1,24 @@
 const std = @import("std");
-const target = @import("builtin").target;
+const builtin = @import("builtin");
+const target = builtin.target;
 
 const scheduler = @import("scheduler.zig");
 
+const use_reactor = blk: {
+    const options = @import("build_options");
+    const root = @import("root");
+
+    break :blk if (@hasDecl(root, "force_reactor"))
+        @as(bool, root.force_reactor)
+    else
+        @as(bool, options.force_reactor);
+};
+
 const DefaultPlatformFactory = switch (target.os.tag) {
-    .linux => @import("platform/io_uring.zig").IoUringPlatform,
-    // .linux => @import("platform/io_reactor.zig").ReactorPlatform,
+    .linux => if (!use_reactor)
+        @import("platform/io_uring.zig").IoUringPlatform
+    else
+        @import("platform/io_reactor.zig").ReactorPlatform,
 
     .macos,
     .tvos,
