@@ -59,8 +59,7 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
             // If we want to support additional flags, we should expose them
             // as discrete config options/enum choices, then convert to the
             // bitfield flags here. For now the defaults are fine.
-            // FIXME: experimenting with SQPOLL
-            const io_uring_flags: u32 = std.os.linux.IORING_SETUP_SQPOLL;
+            const io_uring_flags: u32 = 0;
 
             return Platform{
                 .clock = sched.clock,

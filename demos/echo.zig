@@ -81,17 +81,26 @@ const Server = struct {
         try reader.wait(null);
     }
 
+    fn enable_debug(reader: vx.signal.SignalReader) !void {
+        try reader.wait(null);
+        vx.event.setLevel(.debug);
+    }
+
     fn start(server: *@This()) !void {
         vx.event.emit(ServerStartEvent, .{ .addr = server.addr });
 
         // register handler for SIGINT (ctrl-c)
         const sig_reader = try vx.signal.register(.sigint);
+        const dbg_reader = try vx.signal.register(.sighup);
 
         var lh: vx.task.SpawnHandle(listen) = undefined;
         try vx.task.spawn(&lh, .{server}, null);
 
         var sh: vx.task.SpawnHandle(shutdown) = undefined;
         try vx.task.spawn(&sh, .{sig_reader}, null);
+
+        var dh: vx.task.SpawnHandle(enable_debug) = undefined;
+        try vx.task.spawn(&dh, .{dbg_reader}, null);
 
         switch (try vx.task.select(.{
             .listen = &lh,
@@ -100,6 +109,9 @@ const Server = struct {
             .listen => @panic("Listener exited unexpectedly"),
             .shutdown => vx.event.emit(ServerShutdownEvent, .{}),
         }
+
+        dh.cancel();
+        dh.join() catch {};
     }
 };
 
@@ -242,7 +254,7 @@ pub fn main() !void {
     defer vx.deinit(alloc);
 
     if (res.args.server) {
-        const chan_size = 16; // TODO: make this a CLI arg?
+        const chan_size = 1024; // TODO: make this a CLI arg?
         var server = Server{
             .alloc = alloc,
             .addr = addr,
