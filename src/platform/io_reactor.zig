@@ -99,7 +99,7 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
         clock: *Clock,
         sched: *Scheduler,
         emitter: *Emitter,
-        pending: usize,
+        pending: usize, // all async events; fdt.pending tracks pollable I/O
         entries: []Entry,
         free: OpList,
         fdt: FileDescriptorTable,
@@ -183,6 +183,7 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
 
                 // Remove the timeout. If not found, then the entry has already
                 // been woken up and removed, so there's nothing more to do here.
+                std.debug.print("Cancel removing timeout idx: {d}\n", .{op.idx});
                 if (platform.timers.unregTimeout(op.idx)) |removed| {
                     _ = removed;
 
@@ -194,10 +195,17 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
 
             // Examine timeouts -- if we have any to process, then don't wait
             // in I/O poll operation. We don't process the timeouts yet, though,
-            // to avoid tasks that sleep(0) from hogging the scheduler loop.
-            const now = platform.clock.now();
-            defer platform.prevTime = now; // set up for next call to enter()
+            // to avoid tasks that sleep(0) from hogging the scheduler loop. If
+            // we don't have any timeouts pending, skip the expensive clock
+            // reading (expireTimeouts will return early when range is nil).
+            const now = if (platform.timers.pending > 0)
+                platform.clock.now()
+            else
+                platform.prevTime;
+
+            defer platform.prevTime = now; // set up for next call to poll()
             var expired = platform.timers.expireTimeouts(.{ platform.prevTime, now });
+
             const poll_timeout = if (cancel_count == 0 and expired.peek() == null)
                 timeout_ns
             else
@@ -205,7 +213,10 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
 
             // Poll for I/O
             var poll_count: usize = 0;
-            var nevents = try platform.poller.poll(platform.events, poll_timeout);
+            var nevents = if (platform.fdt.pending > 0)
+                try platform.poller.poll(platform.events, poll_timeout)
+            else
+                0;
 
             for (platform.events[0..nevents]) |*ev| {
                 const fd = ev.descriptor();
@@ -291,8 +302,23 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
             );
         }
 
+        // override close() to remove FDT entries
+        pub fn close(
+            platform: *Platform,
+            fd: Descriptor,
+        ) void {
+            std.debug.print("Removing fdt entry for: {d}\n", .{fd});
+            platform.fdt.removeEntry(fd);
+
+            std.debug.print("[{}] WTF tracked = {}\n", .{
+                threadId(),
+                platform.fdt.fdt[@intCast(usize, fd)].tracked,
+            });
+
+            std.os.close(fd);
+        }
+
         // non-async functions
-        pub const close = posix.close;
         pub const bind = posix.bind;
         pub const listen = posix.listen;
         pub const getsockname = posix.getsockname;
@@ -476,6 +502,12 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
             op: *IoOperation,
             timeout: Timespec,
         ) !void {
+            // Don't bother suspending if the timeout is 0. This allows
+            // suspendTask to avoid preparing an I/O operation if the timeout is
+            // 0, which is an optimization for sleep(0) that does not use
+            // wait().
+            if (timeout == 0) return error.IoCanceled;
+
             try platform.sched.suspendTask(timeout, op);
 
             return switch (op.completion.status) {
@@ -486,6 +518,7 @@ pub fn ReactorPlatform(comptime Scheduler: type) type {
         }
 
         pub fn sleep(platform: *Platform, interval: Timespec) !void {
+            std.debug.print("sleep({d}) invoked\n", .{interval});
             var op = IoOperation{
                 .platform = platform,
                 .args = .sleep,
@@ -878,26 +911,25 @@ fn IoOperationImpl(comptime Platform: type) type {
             callback_ctx: anytype,
             callback_data: usize,
         ) !void {
-            const idx = op.platform.free.pop() orelse unreachable; // TODO: error return?
-            op.idx = idx;
-
-            var entry = &op.platform.entries[idx];
-            entry.op = op;
-
-            // convert timeout to absolute time
-            const abs_timeout = if (timeout != max_time)
-                op.platform.clock.now() + timeout
-            else
-                timeout;
-
-            entry.timeout = abs_timeout;
-
             op.completion = IoCompletion{
                 .status = .invalid,
                 .callback = callback,
                 .callback_ctx = callback_ctx,
                 .callback_data = callback_data,
             };
+
+            // convert timeout to absolute time
+            const abs_timeout = if (timeout == max_time)
+                max_time // optimization for sleep(inf)
+            else
+                op.platform.clock.now() + timeout;
+
+            const idx = op.platform.free.pop() orelse unreachable; // TODO: error return?
+            op.idx = idx;
+
+            var entry = &op.platform.entries[idx];
+            entry.op = op;
+            entry.timeout = abs_timeout;
 
             op.platform.pending += 1;
             op.platform.timers.regTimeout(idx);
@@ -949,6 +981,7 @@ fn IoOperationImpl(comptime Platform: type) type {
                     const fd = op.descriptor() orelse unreachable;
                     if (op.platform.fdt.submitEntry(idx, fd, rdy)) {
                         // lazily add new fd's to poller
+                        std.debug.print("Register {d} with poller\n", .{fd});
                         try op.platform.poller.register(fd);
                     }
                 },
@@ -1005,6 +1038,7 @@ fn TimeWheelImpl(
         entries: []OpEntry,
         slots: []TimerList,
         slot_shift: u6,
+        pending: usize,
 
         pub fn init(
             alloc: std.mem.Allocator,
@@ -1019,6 +1053,7 @@ fn TimeWheelImpl(
                 .entries = entries,
                 .slots = try alloc.alloc(TimerList, num_slots),
                 .slot_shift = @intCast(u6, std.math.log2(slot_resolution)),
+                .pending = 0,
             };
 
             for (tw.slots) |*slot| slot.* = TimerList.init(entries);
@@ -1035,6 +1070,8 @@ fn TimeWheelImpl(
         pub fn regTimeout(tw: *TimeWheel, idx: Index) void {
             const to = tw.entries[idx].timeout;
 
+            tw.pending += 1;
+
             // append entry into timewheel slot
             tw.slots[tw.getSlotIndex(to)].push(idx);
         }
@@ -1050,7 +1087,11 @@ fn TimeWheelImpl(
             // short TimeLists, i.e. enough slots and even distribution across.
             const slot = &tw.slots[tw.getSlotIndex(to)];
 
-            if (slot.unlink(idx)) return to;
+            if (slot.unlink(idx)) {
+                assert(tw.pending > 0);
+                tw.pending -= 1;
+                return to;
+            }
 
             return null;
         }
@@ -1058,6 +1099,9 @@ fn TimeWheelImpl(
         /// Find timeouts in the range (range.0, range.1], and move them
         /// from the timer wheel onto the returned list.
         pub fn expireTimeouts(tw: *TimeWheel, range: [2]Timespec) TimerList {
+            var list = TimerList.init(tw.entries);
+            if (range[0] == range[1]) return list;
+
             const start = tw.getSlotIndex(range[0]);
             const count = std.math.min(
                 tw.getSlotDelta(range),
@@ -1065,7 +1109,6 @@ fn TimeWheelImpl(
             );
             assert(count >= 1);
 
-            var list = TimerList.init(tw.entries);
             var i: usize = 0;
             while (i < count) : (i += 1) {
                 const idx = (start + i) % tw.slots.len;
@@ -1080,6 +1123,9 @@ fn TimeWheelImpl(
 
                         // link into the return list
                         list.push(elem_idx);
+
+                        assert(tw.pending > 0);
+                        tw.pending -= 1;
                     } else {
                         _ = it.next(); // advance the iterator
                     }
@@ -1230,6 +1276,7 @@ fn FileDescriptorTableImpl(
             }
 
             fdt.pending += 1;
+            std.debug.print("[{}] fdt.pending now {d} (tracked = {})\n", .{ threadId(), fdt.pending, fde.tracked });
 
             if (!fde.tracked) {
                 fde.tracked = true;
@@ -1237,6 +1284,22 @@ fn FileDescriptorTableImpl(
             }
 
             return false;
+        }
+
+        // FIXME: comment/tests
+        fn removeEntry(
+            fdt: *FileDescriptorTable,
+            fd: Descriptor,
+        ) void {
+            var fde = &fdt.fdt[@intCast(usize, fd)];
+
+            fde.* = DescriptorEntry{
+                .tracked = false,
+                .rdlist = List.init(fdt.entries),
+                .wrlist = List.init(fdt.entries),
+            };
+
+            std.debug.print("removed {d} -- fdt.pending now {d} (tracked = {})\n", .{ fd, fdt.pending, fde.tracked });
         }
 
         /// Cancels a previously submitted entry from slot `idx' by removing
@@ -1253,7 +1316,10 @@ fn FileDescriptorTableImpl(
             const lists = [_]*List{ &fde.rdlist, &fde.wrlist };
 
             for (lists) |list| {
-                if (list.unlink(idx)) return idx;
+                if (list.unlink(idx)) {
+                    fdt.pending -= 1;
+                    return idx;
+                }
             }
 
             return null;
@@ -1285,6 +1351,8 @@ fn FileDescriptorTableImpl(
                     _ = list.delete(&it) orelse unreachable;
                     ret.push(idx);
                     fdt.pending -= 1;
+
+                    std.debug.print("fdt.pending now {d}\n", .{fdt.pending});
                 }
             }
 
@@ -1330,8 +1398,14 @@ test "fdt" {
     // submit on known fd should return false
     try std.testing.expectEqual(false, fdt.submitEntry(0, 42, .rd));
 
+    // ... but set pending count
+    try std.testing.expectEqual(@as(usize, 1), fdt.pending);
+
     // canceling a pending operation should return its index
     try std.testing.expect(fdt.cancelEntry(0, 42).? == 0);
+
+    // ... and remove a pending item
+    try std.testing.expectEqual(@as(usize, 0), fdt.pending);
 
     // canceling an operation that doesn't exist returns null
     try std.testing.expect(fdt.cancelEntry(0, 42) == null);

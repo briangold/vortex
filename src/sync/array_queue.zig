@@ -35,6 +35,8 @@ pub fn ArrayQueue(comptime T: type, comptime Futex: type) type {
                 // slow-path: wait for slots_avail to become non-zero, then
                 // loop around again, relying on Futex to keep waitlist
                 try Futex.wait(&q.slots_avail, 0, null);
+
+                std.debug.print("Channel push wakeup received\n", .{});
             }
         }
 
@@ -46,6 +48,8 @@ pub fn ArrayQueue(comptime T: type, comptime Futex: type) type {
                 // slow-path: wait for items_avail to become non-zero, then
                 // loop around again, relying on Futex to keep waitlist
                 try Futex.wait(&q.items_avail, 0, null);
+
+                std.debug.print("Channel pop wakeup received\n", .{});
             }
         }
 

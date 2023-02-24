@@ -28,6 +28,8 @@ fn test_spsc(comptime V: type) !void {
         }
 
         fn start() !void {
+            std.debug.print("Starting test_spsc\n", .{});
+
             var c = try Channel(usize).init(alloc, chan_size);
             defer c.deinit(alloc);
 
@@ -72,6 +74,8 @@ fn test_channel(
         }
 
         fn start() !void {
+            std.debug.print("Starting test_channel: {d}/{d}/{d}/{d}\n", .{ chan_size, num_senders, num_receivers, num_messages });
+
             var c = try Channel(usize).init(alloc, chan_size);
             defer c.deinit(alloc);
 
@@ -111,7 +115,9 @@ test "channel" {
     // also validates ordering on the channel
     try test_spsc(vortex.Vortex);
 
-    try test_channel(vortex.Vortex, 16, 1, 128, 1024); // SPMC
+    // FIXME
+    // try test_channel(vortex.Vortex, 16, 1, 1000, 1_000_000_000); // SPMC
+
     try test_channel(vortex.Vortex, 16, 1, 128, 1024); // SPMC
     try test_channel(vortex.Vortex, 16, 128, 1, 1024); // MPSC
     try test_channel(vortex.Vortex, 16, 128, 128, 1024); // MPMC

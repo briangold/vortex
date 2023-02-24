@@ -164,8 +164,28 @@ fn SchedulerImpl(comptime C: type) type {
             const per_tick_limit = 20; // TODO: move to config
 
             while (self.runqueue.try_pop()) |tid| : (count += 1) {
-                // Mark the start of a task fragment.
-                const start = self.clock.now();
+                // Measure the time to run this task fragment. We guard the
+                // time measurement as clock.now() is fairly expensive, and
+                // there's no point calling it (2x!) if we're not going to use
+                // the result.
+                const start = if (self.willEmitEvent(TaskYieldEvent))
+                    self.clock.now()
+                else
+                    0;
+
+                defer {
+                    // NOTE: the delta from start may include OS overhead to
+                    // reschedule the worker thread.
+                    const delta = if (self.willEmitEvent(TaskYieldEvent))
+                        self.clock.now() - start
+                    else
+                        0;
+
+                    self.emitEvent(TaskYieldEvent, .{
+                        .tid = tid,
+                        .delta = delta,
+                    });
+                }
 
                 var task = &self.tasks[tid];
 
@@ -190,18 +210,9 @@ fn SchedulerImpl(comptime C: type) type {
                 // reliably say here is that task 'tid' returned and that
                 // current_task_id (for this worker thread) is null.
 
-                // NOTE: the delta from start may include OS overhead to
-                // reschedule the worker thread.
-                const end = self.clock.now();
-
                 // When we return back here after resuming, the task must have
                 // yielded the worker thread.
                 assert(current_task_id == null);
-
-                self.emitEvent(TaskYieldEvent, .{
-                    .tid = tid,
-                    .delta = end - start,
-                });
 
                 if (count > per_tick_limit) break;
             }
@@ -269,8 +280,6 @@ fn SchedulerImpl(comptime C: type) type {
             const tid = self.descheduleCurrentTask(@frame());
             var task = &self.tasks[tid];
 
-            task.io_token = op.cancelToken();
-
             // adjust the timeout based on task deadline
             const timeout = std.math.min(req_timeout, task.deadline);
 
@@ -282,7 +291,10 @@ fn SchedulerImpl(comptime C: type) type {
                 // to issue the I/O operation. If we are cancelled, invoke the
                 // reschedule callback as though the operation had completed,
                 // as we will pick up the error at the end of this function.
-                if (!task.cancelled) {
+                // If the timeout requested was 0 (e.g., sleep(0)), don't bother
+                // issuing the timeout operation either. Just reschedule.
+                if (!task.cancelled and timeout != 0) {
+                    task.io_token = op.cancelToken();
                     try op.prep(timeout, wrap, self, tid);
                 } else {
                     wrap(self, tid);
@@ -430,8 +442,10 @@ fn SchedulerImpl(comptime C: type) type {
             }
 
             // But we check for timeouts as well
-            if (self.clock.now() >= task.deadline) {
-                return error.TaskTimeout;
+            if (task.deadline != clock.max_time) {
+                if (self.clock.now() >= task.deadline) {
+                    return error.TaskTimeout;
+                }
             }
         }
 
@@ -757,6 +771,12 @@ fn SchedulerImpl(comptime C: type) type {
             user: Event.User,
         ) void {
             self.emitter.emit(self.clock, threadId(), Event, user);
+        }
+
+        fn willEmitEvent(self: *Scheduler, comptime Event: type) bool {
+            const evLevel = @enumToInt(Event.level);
+            const logLevel = @enumToInt(self.emitter.log_level);
+            return (evLevel <= logLevel);
         }
 
         /// Waits for one of several tasks to complete, and cancels all

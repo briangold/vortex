@@ -390,7 +390,8 @@ pub fn IoUringPlatform(comptime Scheduler: type) type {
                 .args = .sleep,
             };
             try platform.sched.suspendTask(interval, &op);
-            _ = try op.complete();
+
+            if (interval > 0) _ = try op.complete();
         }
 
         /// Implements the I/O operations for a Futex. See the platform-

@@ -33,6 +33,8 @@ pub fn Futex(comptime Runtime: type) type {
             expect: u32,
             maybe_interval: ?Timespec,
         ) !void {
+            std.debug.print("Futex.wait({*}={d}, expect {d}) called\n", .{ ptr, ptr.value, expect });
+
             const address = Address.from(ptr);
             const bucket = Bucket.from(address);
 
@@ -113,6 +115,8 @@ pub fn Futex(comptime Runtime: type) type {
         /// Unblocks at most `max_waiters` blocked in a `wait()` call on `ptr`.
         pub fn wake(rt: *Runtime, ptr: *const Atomic(u32), max_waiters: usize) void {
             _ = rt;
+
+            std.debug.print("Futex.wake({*}={d}, wake {d}) called\n", .{ ptr, ptr.value, max_waiters });
 
             const address = Address.from(ptr);
             const bucket = Bucket.from(address);

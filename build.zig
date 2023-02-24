@@ -22,13 +22,21 @@ pub fn addVortexPackage(
     const options_pkg = exe_options.getPackage("build_options");
     const tracy_pkg = ztracy.getPkg(b, options_pkg);
 
-    libexe.addPackage(getVortexPkg(&[_]std.build.Pkg{ tracy_pkg, options_pkg }));
+    const vx_deps = [_]std.build.Pkg{
+        options_pkg,
+        tracy_pkg,
+    };
+
+    libexe.addPackage(getVxPackage(&vx_deps));
+
+    // required for signals implementation
+    // TODO: refactor into signals package and pick up via build helper
     libexe.linkLibC();
 
     ztracy.link(libexe, options.enable_tracy, .{ .fibers = true });
 }
 
-fn getVortexPkg(deps: ?[]const std.build.Pkg) std.build.Pkg {
+fn getVxPackage(deps: ?[]const std.build.Pkg) std.build.Pkg {
     const vortex = std.build.Pkg{
         .name = "vortex",
         .source = FileSource.relative("vortex.zig"),
@@ -37,20 +45,26 @@ fn getVortexPkg(deps: ?[]const std.build.Pkg) std.build.Pkg {
     return vortex;
 }
 
-const demo_pkgs = struct {
+const exec_pkgs = struct {
     const clap = std.build.Pkg{
         .name = "clap",
         .source = FileSource.relative("deps/zig-clap/clap.zig"),
         .dependencies = &[_]std.build.Pkg{},
     };
+
+    const metron = std.build.Pkg{
+        .name = "metron",
+        .source = FileSource.relative("deps/metron/metron.zig"),
+        .dependencies = &[_]std.build.Pkg{},
+    };
 };
 
-fn addDemo(
+fn addVxExecutable(
     b: *Builder,
-    comptime demo: anytype,
+    comptime def: anytype,
     options: anytype,
 ) !void {
-    const exe = b.addExecutable(demo.name, demo.path);
+    const exe = b.addExecutable(def.name, def.path);
 
     addVortexPackage(exe, .{
         .enable_tracy = options.enable_tracy,
@@ -59,17 +73,21 @@ fn addDemo(
 
     exe.setTarget(options.target);
     exe.setBuildMode(options.mode);
-    exe.addPackage(demo_pkgs.clap);
+    exe.addPackage(exec_pkgs.clap);
+    exe.addPackage(exec_pkgs.metron);
+
+    // TODO: make this a build-time option?
+    exe.omit_frame_pointer = false; // for performance analysis
 
     const install_exe = b.addInstallArtifact(exe);
-    const demo_step = b.step(demo.name, "Build " ++ demo.name ++ " demo");
-    demo_step.dependOn(&install_exe.step);
+    const exec_step = b.step(def.name, "Build " ++ def.name ++ " executable");
+    exec_step.dependOn(&install_exe.step);
 }
 
 fn addFuzzer(b: *Builder, comptime fuzzer: anytype) !void {
     const fuzz_lib = b.addStaticLibrary(fuzzer.name ++ "-lib", fuzzer.path);
     fuzz_lib.setBuildMode(.Debug);
-    fuzz_lib.addPackage(getVortexPkg(null)); // TODO: build a tracy package here?
+    fuzz_lib.addPackage(getVxPackage(null)); // TODO: build a tracy package here?
     fuzz_lib.want_lto = true;
     fuzz_lib.bundle_compiler_rt = true;
 
@@ -106,7 +124,7 @@ fn addFuzzer(b: *Builder, comptime fuzzer: anytype) !void {
         fuzzer.path,
     );
     fuzz_debug_exe.setBuildMode(.Debug);
-    fuzz_debug_exe.addPackage(getVortexPkg(null)); // TODO: build tracy package here?
+    fuzz_debug_exe.addPackage(getVxPackage(null)); // TODO: build tracy package here?
 
     // Only install fuzz-debug when the fuzz step is run
     const install_fuzz_debug_exe = b.addInstallArtifact(fuzz_debug_exe);
@@ -119,16 +137,22 @@ pub fn build(b: *Builder) !void {
     const enable_tracy = b.option(bool, "enable-tracy", "Enable Tracy profiler") orelse false;
     const force_reactor = b.option(bool, "force-reactor", "Use readiness (epoll) even when completion API (io_uring) available") orelse false;
 
-    const demos = [_]struct {
+    const ExecDef = struct {
         name: []const u8,
         path: []const u8,
-    }{
+    };
+
+    const demos = [_]ExecDef{
         .{ .name = "one", .path = "demos/one.zig" },
         .{ .name = "echo", .path = "demos/echo.zig" },
     };
 
-    inline for (demos) |demo| {
-        try addDemo(b, demo, .{
+    const benchmarks = [_]ExecDef{
+        .{ .name = "sleeper", .path = "benchmarks/sleeper.zig" },
+    };
+
+    inline for (demos ++ benchmarks) |def| {
+        try addVxExecutable(b, def, .{
             .target = target,
             .mode = mode,
             .enable_tracy = enable_tracy,
@@ -136,8 +160,11 @@ pub fn build(b: *Builder) !void {
         });
     }
 
-    const list_demo_step = b.step("list-demos", "List demos to run");
+    const list_demo_step = b.step("list-demos", "List demos");
     list_demo_step.dependOn(createListStep(b, "demo", demos));
+
+    const list_bench_step = b.step("list-benchmarks", "List benchmarks");
+    list_bench_step.dependOn(createListStep(b, "benchmarks", benchmarks));
 
     ////////////
 
@@ -188,10 +215,7 @@ fn createListStep(
             inline for (list) |item| {
                 std.debug.print("  {s}\n", .{item.name});
             }
-            std.debug.print(
-                "\nBuild with \"zig build {s}-(name)\"\n",
-                .{prefix},
-            );
+            std.debug.print("\nBuild with \"zig build (name)\"\n", .{});
         }
     }.inner;
 

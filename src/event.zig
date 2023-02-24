@@ -105,9 +105,9 @@ pub fn EventRegistry(comptime namespace: []const u8, comptime Tag: type) type {
             assert(@typeInfo(User) == .Struct);
 
             return struct {
-                const code = code;
-                const namespace = namespace;
-                const level = level;
+                pub const code = code;
+                pub const namespace = namespace;
+                pub const level = level;
                 pub const User = User;
 
                 timestamp: Timespec,

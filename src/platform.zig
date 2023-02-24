@@ -4,15 +4,18 @@ const target = builtin.target;
 
 const scheduler = @import("scheduler.zig");
 
-const use_reactor = blk: {
-    const options = @import("build_options");
-    const root = @import("root");
+// FIXME
+// const use_reactor = blk: {
+//     const options = @import("build_options");
+//     const root = @import("root");
 
-    break :blk if (@hasDecl(root, "force_reactor"))
-        @as(bool, root.force_reactor)
-    else
-        @as(bool, options.force_reactor);
-};
+//     break :blk if (@hasDecl(root, "force_reactor"))
+//         @as(bool, root.force_reactor)
+//     else
+//         @as(bool, options.force_reactor);
+// };
+
+const use_reactor = true;
 
 const DefaultPlatformFactory = switch (target.os.tag) {
     .linux => if (!use_reactor)

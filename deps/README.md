@@ -9,3 +9,8 @@ This directory contains vendored libraries.
   - url: https://github.com/Hejsil/zig-clap.git
   - license: MIT
   - rev: 996821a
+
+- metron
+  - url: https://github.com/briangold/metron
+  - license: MIT
+  - rev: 5d10931
